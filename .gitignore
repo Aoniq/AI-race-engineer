@@ -1,0 +1,14 @@
+# Kept local: repository description document
+GitHub+Repository+Description (1).docx
+*.docx
+
+# Secrets
+.env
+
+# Local Python environment and caches
+venv/
+__pycache__/
+*.py[cod]
+
+# Generated pit-radio audio
+static/audio/

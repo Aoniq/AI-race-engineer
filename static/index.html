@@ -1,0 +1,974 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>F1 24 Telemetry Dashboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a0f; color: #ddd; font-family: 'Segoe UI', system-ui, sans-serif; overflow: hidden; height: 100vh; display: flex; flex-direction: column; }
+    #top { display: flex; flex: 1; min-height: 0; }
+    #standings {
+      width: 220px; background: #0e0e16; border-right: 1px solid #1e1e2e;
+      overflow-y: auto; flex-shrink: 0; padding: 8px 0;
+    }
+    #standings .st-head {
+      padding: 4px 10px 8px; font-size: 10px; color: #555;
+      text-transform: uppercase; letter-spacing: 1px;
+    }
+    #standings .st-row {
+      display: grid; grid-template-columns: 28px 1fr 52px 36px;
+      gap: 4px; padding: 4px 10px; font-size: 11px; cursor: pointer;
+      border-left: 2px solid transparent; align-items: center;
+    }
+    #standings .st-row:hover { background: #161622; }
+    #standings .st-row.player { border-left-color: #4fc3f7; background: #121820; }
+    #standings .st-row.selected { background: #1a1a28; }
+    #standings .st-pos { color: #888; font-variant-numeric: tabular-nums; }
+    #standings .st-name { color: #ddd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #standings .st-gap { color: #777; font-variant-numeric: tabular-nums; text-align: right; }
+    #standings .st-tyre { text-align: center; font-size: 10px; font-weight: 700; }
+    #map-wrap { flex: 1; position: relative; background: #0d0d14; min-width: 0; }
+    #map-wrap canvas { display: block; width: 100%; height: 100%; }
+    #panel {
+      width: 320px; background: #12121c; border-left: 1px solid #1e1e2e;
+      padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;
+      flex-shrink: 0;
+    }
+    #panel h2 { font-size: 14px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 2px; }
+    #panel h2 .num { color: #fff; font-weight: bold; }
+    #panel h2 .name { color: #4fc3f7; }
+    #driver-select {
+      width: 100%; background: #1a1a2a; color: #ddd; border: 1px solid #2a2a3a;
+      border-radius: 4px; padding: 6px 8px; font-size: 13px; margin-bottom: 6px;
+      cursor: pointer; outline: none;
+    }
+    #driver-select:focus { border-color: #4fc3f7; }
+    #driver-select option { background: #1a1a2a; color: #ddd; }
+    .row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 13px; border-bottom: 1px solid #1a1a2a; }
+    .row .l { color: #777; }
+    .row .v { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .row .v.high { color: #ff8c00; }
+    .row .v.ok { color: #4fc3f7; }
+    .tire-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; margin: 3px 0; }
+    .tire-grid div { background: #1a1a2a; border-radius: 3px; padding: 3px 5px; text-align: center; font-size: 11px; }
+    .tire-grid div .pos { color: #555; }
+    .tire-grid div .val { font-weight: bold; }
+    .section-label { color: #555; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; padding: 6px 0 2px; border-top: 1px solid #1a1a2a; margin-top: 4px; }
+    .tag { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: bold; }
+    .tag.c3 { background: #2d5a1e; color: #8fde6e; }
+    .tag.c4 { background: #5a3d1e; color: #de9e4e; }
+    .tag.c5 { background: #5a1e1e; color: #de6e6e; }
+    .tag.c2 { background: #1e3d5a; color: #6eb8de; }
+    .tag.c1 { background: #2e1e5a; color: #9e6ede; }
+    .tag.c0 { background: #5a1e4e; color: #de6ebe; }
+    .tag.drs-on { background: #2d5a1e; color: #8fde6e; }
+    .tag.drs-off { background: #1a1a2a; color: #555; }
+    .row .v.trend-up { color: #4caf50; }
+    .row .v.trend-down { color: #f44336; }
+    .row .v.trend-flat { color: #888; }
+    #alert-bar {
+      background: #1a1408; color: #e0c8a0; padding: 8px 16px; font-size: 12px;
+      border-top: 1px solid #553300; display: none;
+      max-height: 18vh; overflow-y: auto; flex-shrink: 0; line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    #alert-bar strong { color: #ff8c00; }
+    #engine-panel {
+      background: #0d1117; color: #c9d1d9; padding: 10px 14px;
+      border-top: 1px solid #1e1e2e; display: none;
+      max-height: 22vh; overflow-y: auto; flex-shrink: 0;
+      font-size: 12px; line-height: 1.4;
+    }
+    #engine-panel h3 { color: #58a6ff; font-size: 11px; text-transform: uppercase; margin: 0 0 6px 0; }
+    .engine-row { display: flex; justify-content: space-between; padding: 2px 0; }
+    .engine-row .el { color: #8b949e; }
+    .engine-row .ev { font-weight: 600; font-variant-numeric: tabular-nums; }
+    .engine-row .ev.good { color: #3fb950; }
+    .engine-row .ev.warn { color: #d29922; }
+    .engine-row .ev.crit { color: #f85149; }
+    #radio-bar {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 14px; background: #0e0e16; border-top: 1px solid #1e1e2e;
+      flex-shrink: 0;
+    }
+    #ptt-btn {
+      min-width: 130px; padding: 10px 16px; border: 1px solid #2a3a4a;
+      border-radius: 6px; background: #1a2430; color: #9fd4ff;
+      font-size: 13px; font-weight: 600; cursor: pointer; letter-spacing: 0.4px;
+    }
+    #ptt-btn:hover { border-color: #4fc3f7; }
+    #ptt-btn.listening {
+      background: #3a1515; border-color: #ff5252; color: #ff8a80;
+      animation: pulse 1s infinite;
+    }
+    #ptt-btn.busy { opacity: 0.65; cursor: wait; }
+    .tag.soft { background: #5a1e1e; color: #de6e6e; }
+    .tag.medium { background: #5a3d1e; color: #de9e4e; }
+    .tag.hard { background: #888; color: #eee; }
+    .tag.inter { background: #1e5a2e; color: #6ede8e; }
+    .tag.wet { background: #1e3d5a; color: #6eb8de; }
+    .wear-bar {
+      height: 4px; background: #1a1a2a; border-radius: 2px; margin-top: 2px; overflow: hidden;
+    }
+    .wear-bar > i {
+      display: block; height: 100%; background: #4fc3f7; border-radius: 2px;
+    }
+    .wear-bar > i.hot { background: #ff8c00; }
+    .wear-bar > i.crit { background: #f44336; }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(255,82,82,0.35); }
+      50% { box-shadow: 0 0 0 8px rgba(255,82,82,0); }
+    }
+    #radio-log {
+      flex: 1; min-width: 0; font-size: 12px; color: #9aa; line-height: 1.35;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    #radio-log .you { color: #4fc3f7; }
+    #radio-log .eng { color: #ffb703; }
+    #radio-hint { color: #555; font-size: 11px; white-space: nowrap; }
+    #status-bar {
+      display: flex; justify-content: space-between; padding: 4px 16px;
+      font-size: 11px; color: #555; border-top: 1px solid #1a1a2a;
+      background: #0a0a0f; flex-shrink: 0;
+    }
+    #status-bar .ok { color: #4caf50; }
+    #status-bar .err { color: #f44336; }
+    audio { display: none; }
+    .sel-hint { color: #555; font-size: 11px; text-align: center; padding: 20px 0; }
+  </style>
+</head>
+<body>
+
+<div id="top">
+  <div id="standings">
+    <div class="st-head">Standings</div>
+    <div id="standings-body"></div>
+  </div>
+  <div id="map-wrap">
+    <canvas id="map"></canvas>
+  </div>
+  <div id="panel">
+    <h2><span id="sel-pos" style="color:#ff6b35">-</span> · <span class="num" id="sel-num">-</span> <span class="name" id="sel-name">-</span> <span id="sel-trend" style="font-size:14px"></span></h2>
+    <select id="driver-select"></select>
+    <div id="panel-body">
+      <div class="sel-hint">Select a driver to view live data</div>
+    </div>
+  </div>
+</div>
+
+<div id="alert-bar"></div>
+<div id="engine-panel">
+  <h3>Engine Analysis</h3>
+  <div id="engine-content"></div>
+</div>
+<div id="radio-bar">
+  <button id="ptt-btn" type="button" title="Click or press Space to toggle mic">MIC OFF</button>
+  <div id="radio-log">Pit radio ready — ask about tyres, box, gaps, fuel…</div>
+  <div id="radio-hint">Space = toggle mic</div>
+</div>
+<div id="status-bar">
+  <span id="status-left">F1 24 · Connecting...</span>
+  <span id="status-right"></span>
+</div>
+
+<audio id="player" autoplay></audio>
+
+<script>
+// ====== DOM refs ======
+const $ = id => document.getElementById(id);
+const canvas = $("map");
+const ctx = canvas.getContext("2d");
+const panelBody = $("panel-body");
+const selNum = $("sel-num");
+const selName = $("sel-name");
+const alertBar = $("alert-bar");
+const enginePanel = $("engine-panel");
+const engineContent = $("engine-content");
+const statusLeft = $("status-left");
+const statusRight = $("status-right");
+const driverSelect = $("driver-select");
+const pttBtn = $("ptt-btn");
+const radioLog = $("radio-log");
+const radioHint = $("radio-hint");
+const standingsBody = $("standings-body");
+
+// ====== State ======
+let allCars = [];
+let playerIdx = -1;
+let selectedIdx = null;
+let currentLap = 0;
+let trackName = "";
+
+// ====== Engine Panel (client-side physics) ======
+function runClientPhysics(cars, playerIdx, lap, track) {
+  const player = cars.find(c => c.idx === playerIdx);
+  if (!player) return null;
+
+  // Tire analysis
+  const tw = player.tireWear || {};
+  const tt = player.tireTemps || {};
+  const tireWears = [tw.FL || 0, tw.FR || 0, tw.RL || 0, tw.RR || 0];
+  const avgWear = tireWears.reduce((a, b) => a + b, 0) / 4;
+  const tireTemps = [tt.FL, tt.FR, tt.RL, tt.RR].filter(t => t != null);
+  const avgTemp = tireTemps.length ? tireTemps.reduce((a, b) => a + b, 0) / tireTemps.length : null;
+  const peakTemp = tireTemps.length ? Math.max(...tireTemps) : null;
+
+  const compoundParams = {
+    "C5": { alpha: 0.035, beta: 0.00070, life: 12, t_hot: 95, t_crit: 105, cliff: 0.88 },
+    "C4": { alpha: 0.030, beta: 0.00050, life: 16, t_hot: 97, t_crit: 105, cliff: 0.90 },
+    "C3": { alpha: 0.025, beta: 0.00035, life: 20, t_hot: 100, t_crit: 110, cliff: 0.92 },
+    "C2": { alpha: 0.020, beta: 0.00025, life: 25, t_hot: 105, t_crit: 115, cliff: 0.93 },
+    "C1": { alpha: 0.015, beta: 0.00018, life: 30, t_hot: 110, t_crit: 120, cliff: 0.94 },
+    "C0": { alpha: 0.012, beta: 0.00014, life: 33, t_hot: 110, t_crit: 120, cliff: 0.95 },
+    "SOFT": { alpha: 0.030, beta: 0.00050, life: 16, t_hot: 97, t_crit: 105, cliff: 0.90 },
+    "MEDIUM": { alpha: 0.025, beta: 0.00035, life: 20, t_hot: 100, t_crit: 110, cliff: 0.92 },
+    "HARD": { alpha: 0.015, beta: 0.00018, life: 30, t_hot: 110, t_crit: 120, cliff: 0.94 },
+  };
+  const cp = compoundParams[player.compound] || compoundParams["MEDIUM"];
+  const age = player.tyreAge || player.stintLaps || 0;
+  const wearFrac = avgWear / 100;
+  const dtAge = cp.alpha * age + cp.beta * (age ** 2);
+  const dtWear = 1.6 * wearFrac; // kappa ~ competitive_loss_s
+  const perfLoss = 0.55 * dtAge + 0.45 * dtWear;
+  const degRate = Math.max(0, cp.alpha + 2 * cp.beta * age);
+  const wearRate = wearFrac / Math.max(age, 1);
+  const remainingWear = (cp.cliff - wearFrac) / Math.max(wearRate, 1e-4);
+  const remainingAge = Math.max(0, cp.life - age);
+  const remainingPerf = degRate > 0 ? Math.max(0, (1.6 - perfLoss) / degRate) : 99;
+  const remaining = Math.min(remainingWear, remainingAge, remainingPerf);
+
+  let overheat = "NONE";
+  if (peakTemp !== null) {
+    if (peakTemp >= cp.t_crit) overheat = "CRITICAL";
+    else if (peakTemp >= cp.t_hot + 5) overheat = "HIGH";
+    else if (peakTemp >= cp.t_hot) overheat = "MEDIUM";
+    else if (peakTemp >= cp.t_hot - 5) overheat = "LOW";
+  }
+
+  // Fuel analysis
+  const fuelKg = player.fuel || 0;
+  const consumption = 1.6;
+  const fuelMargin = (fuelKg - 1.5) / consumption - Math.max(0, (track.totalLaps || 57) - lap);
+  const canPush = fuelMargin > 1.5;
+  const mustSave = fuelMargin < 0.5;
+
+  // Threat analysis
+  const threats = [];
+  for (const c of cars) {
+    if (c.idx === playerIdx) continue;
+    let gap = c.gapToLeader - player.gapToLeader;
+    let oppLap = c.bestLapTime;
+    let playerLap = player.bestLapTime;
+    let paceDelta = null;
+    if (oppLap && playerLap && playerLap > 0) paceDelta = oppLap - playerLap;
+    let lapsToCatch = null;
+    if (gap > 0 && paceDelta !== null && paceDelta < 0) lapsToCatch = gap / (-paceDelta);
+    if (Math.abs(gap) < 5) {
+      threats.push({ name: c.name, gap: gap, paceDelta: paceDelta, catch: lapsToCatch });
+    }
+  }
+  threats.sort((a, b) => Math.abs(a.gap) - Math.abs(b.gap));
+
+  return {
+    tire: { compound: player.compound, age, grip: (1 - 0.32 * wearFrac).toFixed(3), health: Math.max(0, 100 - avgWear * 1.2).toFixed(0), loss: perfLoss.toFixed(3), remaining: remaining.toFixed(1), degRate: degRate.toFixed(4), overheat },
+    fuel: { margin: fuelMargin.toFixed(2), canPush, mustSave, effect: (0.035 * (fuelKg - 20)).toFixed(3) },
+    threats: threats.slice(0, 3),
+  };
+}
+
+function renderEnginePanel(physics) {
+  if (!physics) { enginePanel.style.display = "none"; return; }
+  enginePanel.style.display = "block";
+  const t = physics.tire;
+  const f = physics.fuel;
+  const healthCls = t.health >= 70 ? "good" : t.health >= 40 ? "warn" : "crit";
+  const overheatCls = t.overheat === "NONE" ? "good" : t.overheat === "LOW" ? "warn" : "crit";
+  const fuelCls = f.canPush ? "good" : f.mustSave ? "crit" : "warn";
+
+  let html = `
+    <div class="engine-row"><span class="el">Tire</span><span class="ev">${t.compound} L${t.age} | grip=${t.grip} | health=<span class="ev ${healthCls}">${t.health}%</span></span></div>
+    <div class="engine-row"><span class="el">Deg</span><span class="ev">loss=${t.loss}s | rate=${t.degRate}s/lap | remain=${t.remaining} laps | overheat=<span class="ev ${overheatCls}">${t.overheat}</span></span></div>
+    <div class="engine-row"><span class="el">Fuel</span><span class="ev">margin=<span class="ev ${fuelCls}">${f.margin} laps</span> | effect=${f.effect}s | ${f.canPush ? "CAN PUSH" : f.mustSave ? "MUST SAVE" : "OK"}</span></div>
+  `;
+  if (physics.threats.length > 0) {
+    html += `<div style="margin-top:4px;color:#58a6ff;font-size:10px">THREATS</div>`;
+    for (const th of physics.threats) {
+      html += `<div class="engine-row"><span class="el">${th.name}</span><span class="ev">gap=${th.gap.toFixed(1)}s | d_pace=${th.paceDelta ? th.paceDelta.toFixed(2) + "s" : "n/a"} | catch=${th.catch ? th.catch.toFixed(1) + " laps" : "n/a"}</span></div>`;
+    }
+  }
+  engineContent.innerHTML = html;
+}
+
+// ====== Audio queue ======
+const player = document.getElementById("player");
+let audioQueue = [];
+let isPlaying = false;
+function enqueueAudio(url) { audioQueue.push(url); if (!isPlaying) playNext(); }
+function playNext() {
+  if (audioQueue.length === 0) { isPlaying = false; return; }
+  isPlaying = true;
+  const url = audioQueue.shift();
+  player.src = url;
+  player.onended = playNext;
+  player.load();
+  player.play().catch(() => { isPlaying = false; audioQueue = []; });
+}
+
+// ====== Track outline (learned from live car positions) ======
+const TRACK_BUCKET_M = 15;
+let trackPoints = new Map(); // bucket -> {x, z}
+
+function isValidCarPos(c) {
+  return Math.hypot(c.x || 0, c.z || 0) > 5 && (c.speed || 0) > 20;
+}
+
+function learnTrack() {
+  for (const c of allCars) {
+    if (c.lapDist == null || c.lapDist < 0) continue;
+    if (!isValidCarPos(c)) continue;
+    const bucket = Math.round(c.lapDist / TRACK_BUCKET_M);
+    const prev = trackPoints.get(bucket);
+    if (!prev) {
+      trackPoints.set(bucket, { x: c.x, z: c.z });
+    } else {
+      trackPoints.set(bucket, {
+        x: prev.x * 0.85 + c.x * 0.15,
+        z: prev.z * 0.85 + c.z * 0.15,
+      });
+    }
+  }
+}
+
+/** Ordered samples — only real buckets, no cross-track interpolation. */
+function trackSegments() {
+  if (trackPoints.size < 12) return [];
+  const keys = [...trackPoints.keys()].sort((a, b) => a - b);
+  const segs = [];
+  let seg = [];
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    const p = trackPoints.get(k);
+    if (i > 0) {
+      const pk = keys[i - 1];
+      const pp = trackPoints.get(pk);
+      const gap = k - pk;
+      const dist = Math.hypot(p.x - pp.x, p.z - pp.z);
+      // Break if bucket gap or world jump is too large (prevents chords across track)
+      if (gap > 4 || dist > TRACK_BUCKET_M * 6) {
+        if (seg.length >= 2) segs.push(seg);
+        seg = [];
+      }
+    }
+    seg.push(p);
+  }
+  if (seg.length >= 2) segs.push(seg);
+  return segs;
+}
+
+/** F1 world → screen. Flip X so circuits match broadcast LapTiming maps (Spa was mirrored). */
+function worldToScreen(x, z, cx, cz, scale, w, h) {
+  return [(cx - x) * scale + w / 2, (z - cz) * -scale + h / 2];
+}
+
+function mapTransform() {
+  const segs = trackSegments();
+  const outlinePts = segs.flat();
+  let xMin = Infinity, xMax = -Infinity, zMin = Infinity, zMax = -Infinity;
+  const src = outlinePts.length ? [...outlinePts, ...allCars.filter(isValidCarPos)] : allCars.filter(isValidCarPos);
+  for (const c of src) {
+    if (c.x < xMin) xMin = c.x; if (c.x > xMax) xMax = c.x;
+    if (c.z < zMin) zMin = c.z; if (c.z > zMax) zMax = c.z;
+  }
+  if (!isFinite(xMin)) return null;
+  const dpr = devicePixelRatio;
+  const w = canvas.width, h = canvas.height;
+  const spanX = Math.max(xMax - xMin, 1);
+  const spanZ = Math.max(zMax - zMin, 1);
+  const margin = 52 * dpr;
+  const scale = Math.min((w - margin * 2) / spanX, (h - margin * 2) / spanZ);
+  const cx = (xMin + xMax) / 2, cz = (zMin + zMax) / 2;
+  return { cx, cz, scale, w, h, dpr, segs };
+}
+
+// ====== Canvas resize ======
+function resizeCanvas() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * devicePixelRatio;
+  canvas.height = rect.height * devicePixelRatio;
+  canvas.style.width = rect.width + "px";
+  canvas.style.height = rect.height + "px";
+}
+
+// ====== Driver select population ======
+function populateSelect() {
+  const prevVal = driverSelect.value;
+  driverSelect.innerHTML = "";
+  for (const c of allCars) {
+    const opt = document.createElement("option");
+    opt.value = c.idx;
+    opt.textContent = `#${c.raceNumber} ${c.name}`;
+    driverSelect.appendChild(opt);
+  }
+  if (prevVal && [...driverSelect.options].some(o => o.value === prevVal)) {
+    driverSelect.value = prevVal;
+  }
+}
+
+// ====== Driver select change ======
+driverSelect.addEventListener("change", () => {
+  const idx = parseInt(driverSelect.value);
+  if (!isNaN(idx)) {
+    selectCar(idx);
+  }
+});
+
+function selectCar(idx) {
+  selectedIdx = idx;
+  const car = allCars.find(c => c.idx === idx);
+  renderPanel(car);
+  renderStandings();
+  drawMap();
+  driverSelect.value = idx;
+}
+
+// ====== Map rendering ======
+function drawMap() {
+  const dpr = devicePixelRatio;
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  // Subtle background
+  const bg = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, Math.max(w, h) * 0.6);
+  bg.addColorStop(0, "#12121c");
+  bg.addColorStop(1, "#08080e");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, w, h);
+
+  if (!allCars.length) {
+    ctx.fillStyle = "#444";
+    ctx.font = `${14 * dpr}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.fillText("Waiting for data...", w / 2, h / 2);
+    return;
+  }
+
+  const tf = mapTransform();
+  if (!tf) return;
+  const { cx, cz, scale, segs } = tf;
+
+  function toScreen(x, z) {
+    return worldToScreen(x, z, cx, cz, scale, w, h);
+  }
+
+  function strokeSeg(seg, width, color) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    for (let i = 0; i < seg.length; i++) {
+      const [sx, sy] = toScreen(seg[i].x, seg[i].z);
+      if (i === 0) ctx.moveTo(sx, sy);
+      else ctx.lineTo(sx, sy);
+    }
+    ctx.stroke();
+  }
+
+  // Track ribbon — only along learned segments (accurate, no false chords)
+  for (const seg of segs) {
+    strokeSeg(seg, 14 * dpr, "rgba(255,255,255,0.12)");
+    strokeSeg(seg, 9 * dpr, "#2a2a36");
+    strokeSeg(seg, 1.5 * dpr, "rgba(255,255,255,0.5)");
+  }
+
+  // Cars on track
+  const dotR = Math.max(5 * dpr, 7);
+  for (const c of allCars) {
+    if (!isValidCarPos(c)) continue;
+    const [sx, sy] = toScreen(c.x, c.z);
+    const isPlayer = c.idx === playerIdx;
+    const isSelected = c.idx === selectedIdx;
+
+    if (isPlayer) {
+      ctx.beginPath();
+      ctx.arc(sx, sy, dotR * 2, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(79,195,247,0.15)";
+      ctx.fill();
+    }
+
+    ctx.beginPath();
+    ctx.arc(sx, sy, isPlayer ? dotR * 1.2 : dotR, 0, Math.PI * 2);
+    ctx.fillStyle = isPlayer ? "#4fc3f7" : (isSelected ? "#ffb703" : "#e85d04");
+    ctx.fill();
+    ctx.strokeStyle = "rgba(0,0,0,0.5)";
+    ctx.lineWidth = 1 * dpr;
+    ctx.stroke();
+
+    if (isSelected && !isPlayer) {
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 2 * dpr;
+      ctx.beginPath();
+      ctx.arc(sx, sy, dotR * 1.5, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.fillStyle = "#fff";
+    ctx.font = `bold ${Math.max(8 * dpr, 11)}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(c.raceNumber ?? "?"), sx, sy);
+  }
+
+  // Track label
+  if (trackName) {
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    const pad = 8 * dpr;
+    const label = trackName.toUpperCase();
+    ctx.font = `600 ${11 * dpr}px sans-serif`;
+    const tw = ctx.measureText(label).width;
+    ctx.fillRect(12 * dpr, 12 * dpr, tw + pad * 2, 20 * dpr);
+    ctx.fillStyle = "#aaa";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(label, 12 * dpr + pad, 22 * dpr);
+  }
+}
+
+// ====== Panel update ======
+function fmtGap(s) {
+  if (s == null || isNaN(s)) return "-";
+  if (s <= 0) return "—";
+  return "+" + Number(s).toFixed(1) + "s";
+}
+
+function compoundClass(compound) {
+  const c = String(compound || "?").toLowerCase();
+  if (c.startsWith("c")) return "tag " + c;
+  if (c.includes("soft") || c === "s" || c === "ss") return "tag soft";
+  if (c.includes("med")) return "tag medium";
+  if (c.includes("hard") || c === "h") return "tag hard";
+  if (c.includes("inter")) return "tag inter";
+  if (c.includes("wet")) return "tag wet";
+  return "tag c3";
+}
+
+function wearBar(pct) {
+  const p = Math.max(0, Math.min(100, Number(pct) || 0));
+  const cls = p >= 80 ? "crit" : p >= 55 ? "hot" : "";
+  return `<div class="wear-bar"><i class="${cls}" style="width:${p}%"></i></div>`;
+}
+
+function avgWear(tw) {
+  const vals = [tw.FL, tw.FR, tw.RL, tw.RR].map(Number).filter(n => !isNaN(n));
+  if (!vals.length) return 0;
+  return vals.reduce((a, b) => a + b, 0) / vals.length;
+}
+
+function enrichGaps(cars) {
+  // Ensure gap ahead/behind exist using race position order as fallback
+  const sorted = [...cars].filter(c => c.position > 0).sort((a, b) => a.position - b.position);
+  const byPos = {};
+  sorted.forEach(c => { byPos[c.position] = c; });
+  for (const c of cars) {
+    if (c.gapToAhead == null && c.position > 1) {
+      const ahead = byPos[c.position - 1];
+      if (ahead && ahead.gapToBehind != null) c.gapToAhead = ahead.gapToBehind;
+    }
+    if (c.gapToBehind == null && c.gapToNext != null) c.gapToBehind = c.gapToNext;
+    if (c.tyreAge == null) c.tyreAge = c.stintLaps || 0;
+  }
+}
+
+function renderStandings() {
+  if (!standingsBody) return;
+  const sorted = [...allCars]
+    .filter(c => (c.position || 0) > 0)
+    .sort((a, b) => a.position - b.position);
+  if (!sorted.length) {
+    standingsBody.innerHTML = '<div class="sel-hint" style="padding:12px">Waiting…</div>';
+    return;
+  }
+  standingsBody.innerHTML = sorted.map(c => {
+    const isPlayer = c.idx === playerIdx;
+    const isSel = c.idx === selectedIdx;
+    const gap = c.position === 1 ? "LEADER" : fmtGap(c.gapToLeader);
+    const tyre = c.compound || "?";
+    const age = c.tyreAge ?? c.stintLaps ?? 0;
+    return `<div class="st-row${isPlayer ? " player" : ""}${isSel ? " selected" : ""}" data-idx="${c.idx}">
+      <span class="st-pos">P${c.position}</span>
+      <span class="st-name">#${c.raceNumber || "?"} ${c.name || ""}</span>
+      <span class="st-gap">${gap}</span>
+      <span class="st-tyre"><span class="${compoundClass(tyre)}">${tyre}</span><div style="color:#555;font-size:9px">${age}L</div></span>
+    </div>`;
+  }).join("");
+  standingsBody.querySelectorAll(".st-row").forEach(row => {
+    row.addEventListener("click", () => selectCar(parseInt(row.dataset.idx)));
+  });
+}
+
+function renderPanel(car) {
+  if (!car) {
+    panelBody.innerHTML = '<div class="sel-hint">Select a driver to view live data</div>';
+    selNum.textContent = "-";
+    selName.textContent = "-";
+    $("sel-pos").textContent = "-";
+    $("sel-trend").textContent = "";
+    return;
+  }
+  selNum.textContent = car.raceNumber || "?";
+  selName.textContent = car.name || "";
+  $("sel-pos").textContent = car.position ? "P" + car.position : "-";
+  const t = car.trend || "→";
+  $("sel-trend").textContent = t;
+  $("sel-trend").style.color = t === "↑" ? "#4caf50" : t === "↓" ? "#f44336" : "#888";
+
+  const tt = car.tireTemps || {};
+  const tw = car.tireWear || {};
+  const fuel = car.fuel || 0;
+  const compound = car.compound || "?";
+  const tyreAge = car.tyreAge ?? car.stintLaps ?? 0;
+  const avgW = avgWear(tw);
+  const gapAhead = car.gapToAhead != null ? car.gapToAhead : null;
+  const gapBehind = car.gapToBehind != null ? car.gapToBehind : car.gapToNext;
+
+  panelBody.innerHTML = `
+    <div class="section-label">Race</div>
+    <div class="row"><span class="l">Position</span><span class="v ok">P${car.position || "-"}</span></div>
+    <div class="row"><span class="l">Lap</span><span class="v">${currentLap || "-"}</span></div>
+    <div class="row"><span class="l">Track</span><span class="v">${trackName || "-"}</span></div>
+    <div class="row"><span class="l">Gap Ahead</span><span class="v ${gapAhead != null && gapAhead < 1 ? "high" : "ok"}">${car.position === 1 ? "LEADER" : fmtGap(gapAhead)}</span></div>
+    <div class="row"><span class="l">Gap Behind</span><span class="v ${gapBehind != null && gapBehind < 1 ? "high" : ""}">${fmtGap(gapBehind)}</span></div>
+    <div class="row"><span class="l">To Leader</span><span class="v">${car.position === 1 ? "—" : fmtGap(car.gapToLeader)}</span></div>
+
+    <div class="section-label">Performance</div>
+    <div class="row"><span class="l">Speed</span><span class="v ok">${car.speed || 0} km/h</span></div>
+    <div class="row"><span class="l">RPM</span><span class="v">${car.rpm || 0}</span></div>
+    <div class="row"><span class="l">Gear</span><span class="v ok">${car.gear ?? "N"}</span></div>
+    <div class="row"><span class="l">Current Lap</span><span class="v">${car.lapTime ? Number(car.lapTime).toFixed(1) + "s" : "-"}</span></div>
+    <div class="row"><span class="l">Best Lap</span><span class="v ok">${car.bestLapTime ? Number(car.bestLapTime).toFixed(1) + "s" : "-"}</span></div>
+    <div class="row"><span class="l">Lap Distance</span><span class="v">${car.lapDist != null && car.lapDist >= 0 ? Math.round(car.lapDist) + " m" : "-"}</span></div>
+
+    <div class="section-label">Controls</div>
+    <div class="row"><span class="l">Throttle</span><span class="v">${car.throttle ?? 0}%</span></div>
+    <div class="row"><span class="l">Brake</span><span class="v">${car.brake ?? 0}%</span></div>
+    <div class="row"><span class="l">DRS</span><span class="v"><span class="tag ${car.drs ? 'drs-on' : 'drs-off'}">${car.drs ? "ON" : "OFF"}</span></span></div>
+    <div class="row"><span class="l">ERS Battery</span><span class="v">${car.ersBattery ?? 0}%</span></div>
+
+    <div class="section-label">Tyres</div>
+    <div class="row"><span class="l">Compound</span><span class="v"><span class="${compoundClass(compound)}">${compound}</span></span></div>
+    <div class="row"><span class="l">Tyre Age</span><span class="v">${tyreAge} laps</span></div>
+    <div class="row"><span class="l">Avg Wear</span><span class="v ${avgW >= 70 ? "high" : ""}">${avgW.toFixed(0)}%</span></div>
+    ${wearBar(avgW)}
+    <div class="row" style="margin-top:4px"><span class="l">Fuel</span><span class="v ${fuel < 5 ? 'high' : ''}">${Number(fuel).toFixed(1)} L</span></div>
+    <div class="row"><span class="l">Engine Temp</span><span class="v ${(car.engineTemp || 0) > 115 ? 'high' : ''}">${car.engineTemp || 0}°C</span></div>
+    <div class="row"><span class="l">Damage</span><span class="v ${(car.damage || 0) > 20 ? 'high' : ''}">${car.damage || 0}%</span></div>
+
+    <div class="section-label">Tyre Temps</div>
+    <div class="tire-grid">
+      <div><span class="pos">FL</span><br><span class="val">${tt.FL ?? "-"}°C</span></div>
+      <div><span class="pos">FR</span><br><span class="val">${tt.FR ?? "-"}°C</span></div>
+      <div><span class="pos">RL</span><br><span class="val">${tt.RL ?? "-"}°C</span></div>
+      <div><span class="pos">RR</span><br><span class="val">${tt.RR ?? "-"}°C</span></div>
+    </div>
+    <div class="section-label">Tyre Wear</div>
+    <div class="tire-grid">
+      <div><span class="pos">FL</span><br><span class="val">${tw.FL ?? 0}%</span>${wearBar(tw.FL)}</div>
+      <div><span class="pos">FR</span><br><span class="val">${tw.FR ?? 0}%</span>${wearBar(tw.FR)}</div>
+      <div><span class="pos">RL</span><br><span class="val">${tw.RL ?? 0}%</span>${wearBar(tw.RL)}</div>
+      <div><span class="pos">RR</span><br><span class="val">${tw.RR ?? 0}%</span>${wearBar(tw.RR)}</div>
+    </div>
+  `;
+}
+
+// ====== Canvas click ======
+canvas.addEventListener("click", e => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * devicePixelRatio;
+  const my = (e.clientY - rect.top) * devicePixelRatio;
+
+  if (!allCars.length) return;
+
+  const tf = mapTransform();
+  if (!tf) return;
+  const { cx, cz, scale } = tf;
+
+  let closest = null, closestDist = Infinity;
+  const hitR = 18 * devicePixelRatio;
+  for (const c of allCars) {
+    if (!isValidCarPos(c)) continue;
+    const [sx, sy] = worldToScreen(c.x, c.z, cx, cz, scale, canvas.width, canvas.height);
+    const d = Math.hypot(mx - sx, my - sy);
+    if (d < hitR && d < closestDist) {
+      closestDist = d;
+      closest = c;
+    }
+  }
+  if (closest) {
+    selectCar(closest.idx);
+  }
+});
+
+// ====== WebSocket ======
+let ws;
+function connect() {
+  statusLeft.textContent = "F1 24 · Connecting...";
+  statusLeft.style.color = "#555";
+  ws = new WebSocket("ws://127.0.0.1:8000/ws/pitradio");
+
+  ws.onopen = () => {
+    statusLeft.innerHTML = "F1 24 · <span class='ok'>Connected</span>";
+  };
+
+  ws.onmessage = e => {
+    const d = JSON.parse(e.data);
+
+    if (!d.cars) {
+      if (d.type === "radio") {
+        if (d.driver) setRadioLog(d.driver, d.advice || d.voice || "");
+        if (d.advice) {
+          alertBar.style.display = "block";
+          alertBar.textContent = d.advice;
+        }
+        // Audio already queued from /api/radio response when you talked;
+        // still play if this client didn't initiate (second window).
+        if (d.audio_url && !window.__radioLocalPlay) enqueueAudio(d.audio_url);
+        window.__radioLocalPlay = false;
+      } else if (d.advice) {
+        alertBar.style.display = "block";
+        alertBar.textContent = d.advice;
+        if (d.audio_url) enqueueAudio(d.audio_url);
+      }
+      return;
+    }
+
+    allCars = d.cars;
+    enrichGaps(allCars);
+    const newTrackName = d.track ? d.track.name : "";
+    if (newTrackName !== trackName) {
+      trackName = newTrackName;
+      trackPoints = new Map();
+    }
+    learnTrack();
+    if (d.player_idx !== undefined) playerIdx = d.player_idx;
+    if (d.lap !== undefined) currentLap = d.lap;
+
+    populateSelect();
+
+    if (selectedIdx === null) {
+      selectedIdx = playerIdx >= 0 ? playerIdx : null;
+    }
+
+    let selectedCar = null;
+    if (selectedIdx !== null) {
+      selectedCar = allCars.find(c => c.idx === selectedIdx);
+      if (!selectedCar) {
+        selectedIdx = playerIdx >= 0 ? playerIdx : null;
+        selectedCar = allCars.find(c => c.idx === selectedIdx);
+      }
+    }
+
+    // 运行客户端物理模型
+    const physics = runClientPhysics(allCars, playerIdx, currentLap, d.track || {});
+    renderEnginePanel(physics);
+
+    drawMap();
+    renderStandings();
+
+    if (selectedCar) {
+      selNum.textContent = selectedCar.raceNumber || "?";
+      selName.textContent = selectedCar.name || "";
+      driverSelect.value = selectedIdx;
+    }
+
+    renderPanel(selectedCar);
+
+    statusRight.textContent = `${allCars.length} cars · ${trackName || ""}`;
+    if (currentLap) {
+      statusRight.textContent += ` · L${currentLap}`;
+    }
+
+    // Only update alert when new advice arrives — never wipe it on telemetry ticks
+    if (d.type === "radio") {
+      if (d.driver) setRadioLog(d.driver, d.advice || d.voice || "");
+      else if (d.advice) {
+        alertBar.style.display = "block";
+        alertBar.textContent = d.advice;
+      }
+      if (d.audio_url) enqueueAudio(d.audio_url);
+    } else if (d.advice) {
+      alertBar.style.display = "block";
+      alertBar.textContent = d.advice;
+      if (d.audio_url) enqueueAudio(d.audio_url);
+    }
+  };
+
+  ws.onclose = () => {
+    statusLeft.innerHTML = "F1 24 · <span class='err'>Disconnected</span>";
+    setTimeout(connect, 3000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+// ====== Pit radio (push-to-talk) ======
+function setRadioLog(driverText, engText) {
+  const d = (driverText || "").replace(/</g, "&lt;");
+  const e = (engText || "").replace(/</g, "&lt;");
+  radioLog.innerHTML = `<span class="you">YOU:</span> ${d}` +
+    (e ? ` &nbsp;·&nbsp; <span class="eng">ENG:</span> ${e}` : "");
+}
+
+async function sendToEngineer(text) {
+  const msg = (text || "").trim();
+  if (!msg) return;
+  pttBtn.classList.add("busy");
+  pttBtn.textContent = "ENGINEER…";
+  setRadioLog(msg, "…");
+  try {
+    window.__radioLocalPlay = true;
+    const res = await fetch("/api/radio", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: msg }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || "radio failed");
+    setRadioLog(data.driver || msg, data.reply || data.voice || "");
+    if (data.reply) {
+      alertBar.style.display = "block";
+      alertBar.textContent = data.reply;
+    }
+    if (data.audio_url) enqueueAudio(data.audio_url);
+  } catch (err) {
+    console.error(err);
+    window.__radioLocalPlay = false;
+    setRadioLog(msg, "Radio failed — try again");
+  } finally {
+    pttBtn.classList.remove("busy", "listening");
+    pttBtn.textContent = "MIC OFF";
+  }
+}
+
+function initPitRadio() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  let recognition = null;
+  let listening = false;
+  let armed = false; // toggle state
+
+  function setIdleUi() {
+    pttBtn.classList.remove("listening", "busy");
+    pttBtn.textContent = "MIC OFF";
+    radioHint.textContent = "Space = toggle mic";
+  }
+
+  if (!SpeechRecognition) {
+    radioHint.textContent = "Mic unsupported — type + Enter";
+    pttBtn.textContent = "TYPE BELOW";
+    const input = document.createElement("input");
+    input.id = "radio-input";
+    input.placeholder = "Talk to engineer…";
+    input.style.cssText = "flex:1;min-width:120px;background:#1a1a2a;color:#ddd;border:1px solid #2a2a3a;border-radius:4px;padding:8px 10px;font-size:13px;";
+    radioLog.replaceWith(input);
+    input.addEventListener("keydown", e => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        sendToEngineer(input.value);
+        input.value = "";
+      }
+    });
+    pttBtn.onclick = () => {
+      const t = prompt("Message to engineer:");
+      if (t) sendToEngineer(t);
+    };
+    return;
+  }
+
+  recognition = new SpeechRecognition();
+  recognition.lang = "en-US";
+  recognition.interimResults = true;
+  recognition.continuous = true;
+  recognition.maxAlternatives = 1;
+
+  let finalBits = [];
+
+  recognition.onstart = () => {
+    listening = true;
+    pttBtn.classList.add("listening");
+    pttBtn.textContent = "MIC ON — TAP TO SEND";
+    radioHint.textContent = "Speak, then Space/click again";
+  };
+
+  recognition.onend = () => {
+    listening = false;
+    if (!armed) {
+      setIdleUi();
+      return;
+    }
+    // Chrome often ends continuous sessions; restart while still armed
+    if (!pttBtn.classList.contains("busy")) {
+      try { recognition.start(); } catch (_) {}
+    }
+  };
+
+  recognition.onerror = (ev) => {
+    if (ev.error === "aborted" || ev.error === "no-speech") return;
+    listening = false;
+    armed = false;
+    setIdleUi();
+    radioLog.textContent = `Mic error: ${ev.error}`;
+  };
+
+  recognition.onresult = (ev) => {
+    let interim = "";
+    for (let i = ev.resultIndex; i < ev.results.length; i++) {
+      const t = ev.results[i][0].transcript;
+      if (ev.results[i].isFinal) finalBits.push(t);
+      else interim += t;
+    }
+    const preview = (finalBits.join(" ") + " " + interim).trim();
+    if (preview) setRadioLog(preview, armed ? "(listening…)" : "");
+  };
+
+  function startMic() {
+    if (pttBtn.classList.contains("busy")) return;
+    armed = true;
+    finalBits = [];
+    try { recognition.start(); } catch (_) {}
+  }
+
+  function stopMicAndSend() {
+    armed = false;
+    try { recognition.stop(); } catch (_) {}
+    const text = finalBits.join(" ").trim();
+    finalBits = [];
+    pttBtn.classList.remove("listening");
+    if (text) sendToEngineer(text);
+    else setIdleUi();
+  }
+
+  function toggleMic() {
+    if (pttBtn.classList.contains("busy")) return;
+    if (armed || listening) stopMicAndSend();
+    else startMic();
+  }
+
+  pttBtn.addEventListener("click", e => {
+    e.preventDefault();
+    toggleMic();
+  });
+
+  window.addEventListener("keydown", e => {
+    if (e.code !== "Space" || e.repeat) return;
+    if (e.target && ["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName)) return;
+    e.preventDefault();
+    toggleMic();
+  });
+}
+
+// ====== Init ======
+window.addEventListener("resize", () => { resizeCanvas(); drawMap(); });
+resizeCanvas();
+connect();
+initPitRadio();
+</script>
+</body>
+</html>
