@@ -82,3 +82,22 @@ def test_radio_language_reaches_prompts(foundry):
   analyzer = importlib.reload(analyzer)
   assert "Dutch only" in analyzer.RADIO_SYSTEM_PROMPT
   assert "{LANG}" not in analyzer.SYSTEM_PROMPT and "Dutch" in analyzer.SYSTEM_PROMPT
+
+
+def test_coaching_reaches_strategy_and_radio_prompts(foundry):
+  import json as _json
+  import analyzer
+  analyzer = importlib.reload(analyzer)
+  cars = [{"idx": 0, "name": "YOU", "position": 1, "compound": "C3", "tyreAge": 5}]
+  analyzer.analyze(cars, 0, 5, {"name": "Zandvoort"}, coaching="DRIVER COACHING (lap 4):\n  - C3: braking too deep")
+  strategy = fake_foundry.REQUESTS[-1]["body"]["messages"][1]["content"]
+  assert "DRIVER COACHING" in strategy and "C3: braking too deep" in strategy
+
+  out = analyzer.radio_reply("where am I losing time?", cars, 0, 5, {"name": "Zandvoort"},
+                             coaching={"issues": ["C3: braking too deep"]})
+  payload = _json.loads(fake_foundry.REQUESTS[-1]["body"]["messages"][1]["content"])
+  assert payload["coaching"]["issues"] == ["C3: braking too deep"]
+  assert out["voice"]
+
+  line = analyzer.coaching_call("C3: braking too deep", "fallback")
+  assert line.startswith("Corner 3")

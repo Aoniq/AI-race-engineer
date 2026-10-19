@@ -135,3 +135,36 @@ def test_2026_season_pack_layout_has_24_cars():
   assert ctypes.sizeof(lay["telemetry"]) == 59  # engine temperature is uint8
   assert ctypes.sizeof(lay["status"]) == 59     # + ERS harvest limit
   assert ctypes.sizeof(lay["participant"]) == 60  # 16-bit driver/network/team ids
+
+
+def test_player_sample_stream_with_motion_ex():
+  samples, sessions = [], []
+  acc = P.F1Accumulator(on_player_sample=samples.append, on_session=sessions.append)
+
+  s = pk.PacketSessionData(); _hdr(s, 1); s.track_id = 13; s.track_length = 5807; s.session_type = 1
+  acc.feed(bytes(s))
+  lap = pk.PacketLapData(); _hdr(lap, 2)
+  d = lap.lap_data[3]
+  d.car_position = 1; d.current_lap_num = 4; d.lap_distance = 812.5; d.current_lap_time_in_ms = 15250
+  d.current_lap_invalid = 1; d.result_status = 2
+  acc.feed(bytes(lap))
+  ex = pk.PacketMotionExData(); _hdr(ex, 13)
+  for j, v in enumerate((0.31, 0.29, -0.6, -0.05)):  # RL RR FL FR
+    ex.wheel_slip_ratio[j] = v
+    ex.wheel_slip_angle[j] = v / 10
+  acc.feed(bytes(ex))
+  t = pk.PacketCarTelemetryData(); _hdr(t, 6)
+  c = t.car_telemetry_data[3]
+  c.speed = 212; c.throttle = 0.0; c.brake = 0.9; c.steer = -0.25; c.gear = 4
+  for j, v in enumerate((0, 0, 7, 1)):
+    c.surface_type[j] = v
+  acc.feed(bytes(t))
+
+  assert sessions and sessions[0]["track"] == "Suzuka" and sessions[0]["track_length"] == 5807
+  assert len(samples) == 1
+  smp = samples[0]
+  assert (smp["lap"], smp["dist"], smp["lap_ms"], smp["invalid"]) == (4, 812.5, 15250, True)
+  assert (smp["speed"], smp["brake"], smp["gear"]) == (212, pytest.approx(0.9), 4)
+  assert smp["surface"] == [0, 0, 7, 1]
+  assert smp["slip_ratio"] == pytest.approx([0.31, 0.29, -0.6, -0.05])
+  assert smp["slip_angle"][2] == pytest.approx(-0.06)

@@ -95,6 +95,17 @@ L15/57 | DEFEND P2 — DRS inside  | He gains +0.3s DRS, slow T3 exit by 0.15s
 L20/57 | Fuel save — lift per lap | 2.3kg short to finish
 ```
 
+### 5) Driver Coaching
+
+Only when a DRIVER COACHING section is present. Max 4 lines: the corners costing the most
+time and what to change there, then the tyre-management tip for the axle that limits the
+stint. Use the corner names (C1, C2, ...) exactly as given.
+```
+DRIVER COACHING
+C3   | too deep: brake at your marker, carry apex speed | -0.18s
+TYRES| rears limit (2.1%/lap): squeeze throttle out of C5, C9
+```
+
 ---
 
 ## Analysis Framework
@@ -107,6 +118,7 @@ Priority order:
 4. Opponent moves: pits, compound delta, pace trend
 5. Fuel: enough to finish?
 6. External events
+7. Driving: corners losing time, and driving habits that wear the limiting tyres
 ```
 
 ---
@@ -121,12 +133,21 @@ Priority order:
   - voice must only address the player car, never other drivers
 - Write in {LANG}
 - Tyre compounds go from C6 (softest) to C0 (hardest); `fuelLapsLeft` is the game's own fuel margin in laps (+ = spare)
-- Respect the pit window from the session data and any SC/VSC (cheap pit stop)""".replace("{LANG}", RADIO_LANGUAGE_NAME)
+- Respect the pit window from the session data and any SC/VSC (cheap pit stop)
+- When tyre life decides the strategy, factor in the coaching tyre tips (smoother driving extends the stint)""".replace("{LANG}", RADIO_LANGUAGE_NAME)
 
 
 RADIO_SYSTEM_PROMPT = f"""Race engineer on live team radio in F1 25. Answer the driver using the telemetry JSON.
-Rules: {RADIO_LANGUAGE_NAME} only. Max 18 words. Direct radio style. No filler. Use only numbers present in the JSON.
+Rules: {RADIO_LANGUAGE_NAME} only. Max 18 words (max 28 for driving-technique questions). Direct radio style.
+No filler. Use only numbers present in the JSON.
+Questions about driving, braking, where time is lost or saving tyres: answer from `coaching`
+(name the corner as given, e.g. "corner 3", and say what to change).
 Return: {{"voice":"..."}}
+"""
+
+COACH_CALL_PROMPT = f"""You are an F1 race engineer giving one short coaching call on team radio after a lap.
+Turn the finding into one radio call in {RADIO_LANGUAGE_NAME}, max 16 words, direct, encouraging, no filler.
+Say corners as "corner N". Keep the numbers that matter (meters, km/h, tenths). Return: {{"voice":"..."}}
 """
 
 
@@ -162,7 +183,7 @@ def _slim_car(c: dict) -> dict:
     }
 
 
-def analyze(cars: list, player_idx: int, lap: int, track: dict = None) -> dict:
+def analyze(cars: list, player_idx: int, lap: int, track: dict = None, coaching: str = "") -> dict:
     try:
         # Run the physics models first so the LLM gets computed numbers
         track_data = track or {"name": "Unknown"}
@@ -172,6 +193,7 @@ def analyze(cars: list, player_idx: int, lap: int, track: dict = None) -> dict:
         user_content = (
             f"PHYSICS ENGINE ANALYSIS:\n{engine_summary}\n\n"
             f"SESSION: {json.dumps(track_data, ensure_ascii=False)}\n\n"
+            + (f"{coaching}\n\n" if coaching else "") +
             f"RAW TELEMETRY:\n{json.dumps({'player_idx': player_idx, 'lap': lap, 'cars': cars}, ensure_ascii=False, separators=(',', ':'))}"
         )
 
@@ -188,7 +210,8 @@ def analyze(cars: list, player_idx: int, lap: int, track: dict = None) -> dict:
         return {"advice": "", "voice": ""}
 
 
-def radio_reply(message: str, cars: list, player_idx: int, lap: int, track: dict | None = None) -> dict:
+def radio_reply(message: str, cars: list, player_idx: int, lap: int, track: dict | None = None,
+                coaching: dict | None = None) -> dict:
     """Answer a live driver radio call using current telemetry (latency-tuned)."""
     message = (message or "").strip()
     if not message:
@@ -215,6 +238,8 @@ def radio_reply(message: str, cars: list, player_idx: int, lap: int, track: dict
         "field": slim[:12],
         "physics": _radio_physics(cars_list, player_idx, lap, track_data),
     }
+    if coaching:
+        payload["coaching"] = coaching
 
     try:
         result = chat_json(
@@ -261,3 +286,16 @@ def _radio_physics(cars_list, player_idx, lap, track_data) -> dict:
             for t in engine_analysis.opponent_threats[:3]
         ],
     }
+
+
+def coaching_call(finding_text: str, fallback: str) -> str:
+    """One short spoken coaching line for a finding, in the radio language."""
+    try:
+        result = chat_json(
+            COACH_CALL_PROMPT, finding_text,
+            max_tokens=400, timeout=15, reasoning_effort=RADIO_REASONING,
+        )
+        return (result.get("voice") or "").strip() or fallback
+    except Exception as e:
+        print(f"Foundry coaching call failed: {e}")
+        return fallback

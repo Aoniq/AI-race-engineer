@@ -27,8 +27,8 @@
     #standings .st-name { color: #ddd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #standings .st-gap { color: #777; font-variant-numeric: tabular-nums; text-align: right; }
     #standings .st-tyre { text-align: center; font-size: 10px; font-weight: 700; }
-    #map-wrap { flex: 1; position: relative; background: #0d0d14; min-width: 0; }
-    #map-wrap canvas { display: block; width: 100%; height: 100%; }
+    #map-wrap { flex: 1; position: relative; background: #0d0d14; min-width: 0; min-height: 0; overflow: hidden; }
+    #map-wrap canvas { display: block; position: absolute; inset: 0; width: 100%; height: 100%; }
     #panel {
       width: 320px; background: #12121c; border-left: 1px solid #1e1e2e;
       padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;
@@ -86,6 +86,35 @@
     .engine-row .ev.good { color: #3fb950; }
     .engine-row .ev.warn { color: #d29922; }
     .engine-row .ev.crit { color: #f85149; }
+    #coach-panel {
+      background: #0c1210; color: #c9d1d9; padding: 8px 14px;
+      border-top: 1px solid #1e2e26; flex-shrink: 0;
+      max-height: 26vh; overflow-y: auto; font-size: 12px; line-height: 1.4;
+    }
+    #coach-panel h3 {
+      color: #3fb950; font-size: 11px; text-transform: uppercase; margin: 0 0 6px 0;
+      display: flex; justify-content: space-between; cursor: pointer; user-select: none;
+    }
+    #coach-panel h3 .meta { color: #6e7681; text-transform: none; font-weight: normal; }
+    #coach-panel.collapsed #coach-body { display: none; }
+    #coach-body { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; }
+    @media (max-width: 900px) { #coach-body { grid-template-columns: 1fr; } }
+    .coach-item { padding: 2px 0 2px 8px; border-left: 2px solid #30363d; margin-bottom: 3px; }
+    .coach-item.loss { border-left-color: #f85149; }
+    .coach-item.tyre { border-left-color: #d29922; }
+    .coach-item .k { color: #8b949e; font-size: 10px; text-transform: uppercase; margin-right: 6px; }
+    .coach-sub { color: #6e7681; font-size: 10px; text-transform: uppercase; margin: 6px 0 3px; }
+    .coach-sub:first-child { margin-top: 0; }
+    .corner-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .corner-chip {
+      background: #161b22; border: 1px solid #30363d; border-radius: 4px; padding: 2px 6px;
+      font-size: 11px; font-variant-numeric: tabular-nums;
+    }
+    .corner-chip.good { border-color: #2ea043; color: #7ee787; }
+    .corner-chip.warn { border-color: #9e6a03; color: #e3b341; }
+    .corner-chip.bad { border-color: #da3633; color: #ffa198; }
+    .wear-row { display: flex; gap: 10px; font-variant-numeric: tabular-nums; }
+    .wear-row b.hi { color: #ffa198; }
     #radio-bar {
       display: flex; align-items: center; gap: 10px;
       padding: 8px 14px; background: #0e0e16; border-top: 1px solid #1e1e2e;
@@ -161,6 +190,13 @@
   <h3>Engine Analysis</h3>
   <div id="engine-content"></div>
 </div>
+<div id="coach-panel">
+  <h3 id="coach-head"><span>Driving Coach</span><span class="meta" id="coach-meta">learning the track…</span></h3>
+  <div id="coach-body">
+    <div id="coach-findings"><div class="coach-item">Drive one full flying lap of F1 25 — the coach learns the corners, then compares every lap with your own best through each corner.</div></div>
+    <div id="coach-side"></div>
+  </div>
+</div>
 <div id="radio-bar">
   <button id="ptt-btn" type="button" title="Click or press Space to toggle mic">MIC OFF</button>
   <div id="radio-log">Pit radio ready — ask about tyres, box, gaps, fuel…</div>
@@ -199,6 +235,8 @@ let selectedIdx = null;
 let currentLap = 0;
 let trackName = "";
 let gameLabel = "F1 25";
+let coachReport = null;
+let coachCorners = [];
 
 // ====== Engine Panel (client-side physics) ======
 function runClientPhysics(cars, playerIdx, lap, track) {
@@ -485,6 +523,31 @@ function drawMap() {
     strokeSeg(seg, 1.5 * dpr, "rgba(255,255,255,0.5)");
   }
 
+  // Learned corners (driving coach), coloured by last lap's time vs personal best
+  if (coachCorners.length) {
+    const deltas = {};
+    for (const row of (coachReport && coachReport.corner_table) || []) deltas[row.corner] = row.delta;
+    ctx.font = `bold ${10 * dpr}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (const c of coachCorners) {
+      if (c.x === null || c.x === undefined) continue;
+      const [sx, sy] = toScreen(c.x, c.z);
+      const d = deltas[c.corner];
+      const col = d === undefined || d === null ? "#6e7681" : d >= 0.1 ? "#f85149" : d >= 0.03 ? "#d29922" : "#3fb950";
+      ctx.beginPath();
+      ctx.arc(sx, sy, 9 * dpr, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(13,17,23,0.85)";
+      ctx.fill();
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 1.5 * dpr;
+      ctx.stroke();
+      ctx.fillStyle = col;
+      ctx.fillText(c.corner, sx, sy);
+    }
+    ctx.textBaseline = "alphabetic";
+  }
+
   // Cars on track
   const dotR = Math.max(5 * dpr, 7);
   for (const c of allCars) {
@@ -726,6 +789,14 @@ function connect() {
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
 
+    if (d.type === "coaching") {
+      if (d.corners) coachCorners = d.corners;
+      renderCoach(d.report);
+      if (d.voice) radioLog.innerHTML = `<span class="eng">COACH:</span> ${esc(d.voice)}`;
+      if (d.audio_url) enqueueAudio(d.audio_url);
+      drawMap();
+      return;
+    }
     if (!d.cars) {
       if (d.type === "radio") {
         if (d.driver) setRadioLog(d.driver, d.advice || d.voice || "");
@@ -982,11 +1053,79 @@ function initPitRadio() {
   });
 }
 
+// ====== Driving coach ======
+const coachPanel = $("coach-panel");
+const esc = t => String(t ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;");
+$("coach-head").addEventListener("click", () => coachPanel.classList.toggle("collapsed"));
+
+function renderCoach(r) {
+  coachReport = r || null;
+  const meta = $("coach-meta");
+  const findingsEl = $("coach-findings");
+  const side = $("coach-side");
+  if (!r) return;
+  meta.textContent = `Lap ${r.lap} · ${r.lap_time_str} · best ${r.best_lap_str}` +
+    (r.valid ? "" : " · invalid") + (r.time_lost_in_corners > 0 ? ` · ${r.time_lost_in_corners.toFixed(2)}s left on track` : "");
+
+  let html = `<div class="coach-sub">Last lap</div>`;
+  if (!r.findings.length) html += `<div class="coach-item">Clean lap — nothing to fix.</div>`;
+  for (const f of r.findings.slice(0, 5)) {
+    const cls = f.loss_s >= 0.05 ? "loss" : f.tyre ? "tyre" : "";
+    const label = f.kind.replace("_", " ");
+    html += `<div class="coach-item ${cls}"><span class="k">${esc(label)}</span>${esc(f.text)}</div>`;
+  }
+  if (r.focus && r.focus.length) {
+    html += `<div class="coach-sub">Losing time every lap</div><div class="coach-item loss">` +
+      r.focus.map(x => `${esc(x.corner)} ≈ ${x.avg_loss_s.toFixed(2)}s/lap`).join(" · ") + `</div>`;
+  }
+  findingsEl.innerHTML = html;
+
+  let s = `<div class="coach-sub">Corners vs your best</div><div class="corner-chips">`;
+  for (const c of r.corner_table) {
+    const d = c.delta;
+    const cls = d === null ? "" : d >= 0.1 ? "bad" : d >= 0.03 ? "warn" : "good";
+    const txt = d === null ? "—" : (d >= 0 ? "+" : "") + d.toFixed(2);
+    const sgn = v => (v >= 0 ? "+" : "") + v;
+    const tip = [c.brake_m !== null ? `brake ${sgn(c.brake_m)} m` : "", c.apex_kmh !== null ? `apex ${sgn(c.apex_kmh)} km/h` : ""]
+      .filter(Boolean).join(", ");
+    s += `<span class="corner-chip ${cls}" title="${esc(tip)}">${esc(c.corner)} ${txt}</span>`;
+  }
+  s += `</div>`;
+  const t = r.tyre || {};
+  if (t.wear_per_lap) {
+    const w = t.wear_per_lap;
+    const max = Math.max(w.FL, w.FR, w.RL, w.RR);
+    const cell = k => `<span>${k} <b class="${w[k] === max ? "hi" : ""}">${w[k].toFixed(1)}%</b></span>`;
+    s += `<div class="coach-sub">Tyre wear per lap · ${esc(t.limiting_axle || "")} limited</div>` +
+      `<div class="wear-row">${cell("FL")}${cell("FR")}${cell("RL")}${cell("RR")}</div>`;
+  }
+  for (const tip of (t.tips || [])) s += `<div class="coach-item tyre" style="margin-top:4px">${esc(tip.text)}</div>`;
+  if (r.has_slip_data === false) {
+    s += `<div class="coach-sub">No Motion Ex data — lock-ups, wheelspin and slides need UDP Format 2025 at 20Hz+</div>`;
+  }
+  side.innerHTML = s;
+}
+
+async function loadCoaching() {
+  try {
+    const res = await fetch("/api/coaching");
+    const d = await res.json();
+    coachCorners = d.corners || [];
+    if (d.report) renderCoach(d.report);
+    else if (!d.learning) $("coach-meta").textContent = `${coachCorners.length} corners learned — finish a lap`;
+  } catch (_) {}
+}
+
 // ====== Init ======
 window.addEventListener("resize", () => { resizeCanvas(); drawMap(); });
+// Bottom panels appear and grow at runtime: keep the map canvas matched to its box
+if (window.ResizeObserver) {
+  new ResizeObserver(() => { resizeCanvas(); drawMap(); }).observe(canvas.parentElement);
+}
 resizeCanvas();
 connect();
 initPitRadio();
+loadCoaching();
 </script>
 </body>
 </html>

@@ -11,7 +11,8 @@ from fastapi import FastAPI, File, UploadFile, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
-from analyzer import analyze, radio_reply
+from analyzer import analyze, radio_reply, coaching_call
+from coach import DrivingCoach
 from tts_bridge import synthesize
 from foundry import transcribe, CHAT_DEPLOYMENT, TTS_DEPLOYMENT, STT_DEPLOYMENT, client as foundry_client
 from f1_parser import F1Accumulator
@@ -26,8 +27,15 @@ UDP_DEBUG = os.getenv("UDP_DEBUG", "0") == "1"
 UDP_DUMP = os.getenv("UDP_DUMP", "0") == "1"
 ANALYSIS_INTERVAL = float(os.getenv("ANALYSIS_INTERVAL", "15"))
 MAX_RADIO_AUDIO_BYTES = 10 * 1024 * 1024
+# Spoken coaching after a lap: auto = driving tips in practice/qualifying/time trial,
+# only tyre-saving tips in races; always = every session; off = screen and radio only
+COACH_VOICE = os.getenv("COACH_VOICE", "auto").strip().lower()
+COACH_RACE_EVERY_LAPS = max(1, int(os.getenv("COACH_RACE_EVERY_LAPS", "3")))
+COACH_MIN_LOSS_S = float(os.getenv("COACH_MIN_LOSS_S", "0.08"))
 
-pit_radios = []
+pit_radios: dict = {}  # dashboard websocket -> asyncio.Lock (one send at a time per client)
+UI_MAX_FPS = float(os.getenv("UI_MAX_FPS", "15"))
+_last_ui_push = 0.0
 _last_analysis_time = 0.0
 _last_advice = ""
 _last_udp_time = 0.0
@@ -41,7 +49,56 @@ BASE_DIR = Path(__file__).parent
 dump_dir = BASE_DIR / "udp_dump"
 _dump_count = 0
 
-f1_acc = F1Accumulator()
+coach = DrivingCoach()
+f1_acc = F1Accumulator(on_player_sample=coach.on_sample, on_session=coach.on_session)
+_last_coach_voice = (None, -99)  # (session uid, lap) of the last spoken race tip
+
+
+def _on_lap_report(report: dict):
+  """Called by the coach (inside the UDP handler) after every completed lap."""
+  try:
+    asyncio.get_running_loop().create_task(_publish_coaching(report))
+  except RuntimeError:
+    pass
+
+
+coach.on_lap_report(_on_lap_report)
+
+
+def _pick_coaching_line(report: dict) -> tuple[str, str] | None:
+  """(finding text, English fallback voice) worth saying after this lap, or None."""
+  global _last_coach_voice
+  if COACH_VOICE == "off" or report.get("pit"):
+    return None
+  session = (coach.session or {}).get("session", "")
+  racing = session.startswith("Race")
+  if COACH_VOICE == "auto" and racing:
+    # races: only tyre management, and not every lap
+    uid = (coach.session or {}).get("session_uid")
+    if _last_coach_voice[0] == uid and report["lap"] - _last_coach_voice[1] < COACH_RACE_EVERY_LAPS:
+      return None
+    tips = report["tyre"]["tips"]
+    if not tips or report["tyre"]["limiting_axle"] not in ("front", "rear"):
+      return None
+    _last_coach_voice = (uid, report["lap"])
+    return tips[0]["text"], tips[0]["text"]
+  top = report.get("top")
+  if not top:
+    return None
+  if top["loss_s"] < COACH_MIN_LOSS_S and not top["tyre"] and top["kind"] not in ("off_track",):
+    return None
+  return top["text"], top["voice"]
+
+
+async def _publish_coaching(report: dict):
+  payload = {"type": "coaching", "report": report, "corners": coach.corners_for_map()}
+  line = _pick_coaching_line(report)
+  if line:
+    voice = await asyncio.to_thread(coaching_call, *line)
+    payload["voice"] = voice
+    payload["audio_url"] = await synthesize(voice)
+    print(f"[COACH] L{report['lap']}: {voice}")
+  await _broadcast(payload)
 
 
 class Gt7Protocol(asyncio.DatagramProtocol):
@@ -126,24 +183,25 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 app.mount("/audio", StaticFiles(directory=BASE_DIR / "static/audio"), name="audio")
 
 
-async def _broadcast(payload: dict):
-  dead = []
-  for client in pit_radios.copy():
+async def _broadcast(payload: dict, droppable: bool = False):
+  """Send to every dashboard. Telemetry frames are `droppable`: skipped for a client that is
+  still busy receiving the previous message, so advice, coaching and radio always get through."""
+  for client, lock in list(pit_radios.items()):
+    if droppable and lock.locked():
+      continue
     try:
-      await client.send_json(payload)
-    except Exception:
-      dead.append(client)
-  for client in dead:
-    try:
-      pit_radios.remove(client)
-    except ValueError:
-      pass
+      async with lock:
+        await client.send_json(payload)
+    except Exception as e:
+      print(f"Dashboard disconnected ({type(e).__name__})")
+      pit_radios.pop(client, None)
 
 
 async def _run_analysis(cars: list, player_idx: int, lap: int, source: str, track: dict = None):
   global _last_advice
   try:
-    result = await asyncio.to_thread(analyze, cars, player_idx, lap, track)
+    coaching = coach.summary_for_llm() if source == "udp" else ""
+    result = await asyncio.to_thread(analyze, cars, player_idx, lap, track, coaching)
     advice = result.get("advice", "")
     voice = result.get("voice", "")
     _last_advice = advice
@@ -165,7 +223,7 @@ async def _run_analysis(cars: list, player_idx: int, lap: int, source: str, trac
 
 async def process_frame(data: dict, source: str):
   global _last_analysis_time, _last_advice, _last_udp_time, _fallback
-  global _last_cars, _last_player_idx, _last_lap, _last_track
+  global _last_cars, _last_player_idx, _last_lap, _last_track, _last_ui_push
 
   cars = data.get("cars", [])
   player_idx = data.get("player_idx", -1)
@@ -186,16 +244,19 @@ async def process_frame(data: dict, source: str):
   _last_lap = lap
   _last_track = track
 
-  await _broadcast({
-    "advice": _last_advice,
-    "voice": "",
-    "audio_url": None,
-    "cars": cars,
-    "track": track,
-    "player_idx": player_idx,
-    "lap": lap,
-    "game": data.get("game") or ("Simulator" if source == "simulator" else "Live"),
-  })
+  now = time.time()
+  if now - _last_ui_push >= 1.0 / UI_MAX_FPS:
+    _last_ui_push = now
+    await _broadcast({
+      "advice": _last_advice,
+      "voice": "",
+      "audio_url": None,
+      "cars": cars,
+      "track": track,
+      "player_idx": player_idx,
+      "lap": lap,
+      "game": data.get("game") or ("Simulator" if source == "simulator" else "Live"),
+    }, droppable=True)
 
   now = time.time()
   if now - _last_analysis_time >= ANALYSIS_INTERVAL:
@@ -206,6 +267,13 @@ async def process_frame(data: dict, source: str):
 @app.get("/favicon.ico")
 async def favicon():
   return Response(status_code=204)
+
+
+@app.get("/api/coaching")
+async def api_coaching():
+  """Latest coaching report and learned corners (dashboard loads this on connect)."""
+  return {"report": coach.report, "corners": coach.corners_for_map(),
+          "session": coach.session, "learning": not coach.corners}
 
 
 @app.get("/")
@@ -248,7 +316,8 @@ async def _answer_driver(text: str) -> dict:
     return {"ok": False, "error": "empty message"}
 
   result = await asyncio.to_thread(
-    radio_reply, text, _last_cars, _last_player_idx, _last_lap, _last_track
+    radio_reply, text, _last_cars, _last_player_idx, _last_lap, _last_track,
+    coach.radio_context() if coach.corners or coach.samples else None,
   )
   reply = result.get("reply", "")
   voice = result.get("voice", "") or reply
@@ -289,17 +358,16 @@ async def telemetry_ws(websocket: WebSocket):
 
 @app.websocket("/ws/pitradio")
 async def pitradio_ws(websocket: WebSocket):
-  global pit_radios
   await websocket.accept()
-  pit_radios.append(websocket)
+  pit_radios[websocket] = asyncio.Lock()
   print(f"Frontend connected ({len(pit_radios)} online)")
   try:
-    await websocket.receive_text()
+    while True:
+      await websocket.receive_text()
   except Exception:
     pass
   finally:
-    if websocket in pit_radios:
-      pit_radios.remove(websocket)
+    pit_radios.pop(websocket, None)
 
 
 def _open_browser():

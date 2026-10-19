@@ -140,6 +140,25 @@ class LapData(_S):
   ]
 
 
+class MotionExPrefix(_S):
+  """Leading part of PacketMotionExData (player car only, packet 13); same in 2024-2026."""
+  _fields_ = [
+    ("suspension_position", f32 * 4), ("suspension_velocity", f32 * 4),
+    ("suspension_acceleration", f32 * 4), ("wheel_speed", f32 * 4),
+    ("wheel_slip_ratio", f32 * 4), ("wheel_slip_angle", f32 * 4),
+    ("wheel_lat_force", f32 * 4), ("wheel_long_force", f32 * 4),
+    ("height_of_cog_above_ground", f32), ("local_velocity_x", f32),
+    ("local_velocity_y", f32), ("local_velocity_z", f32),
+    ("angular_velocity_x", f32), ("angular_velocity_y", f32), ("angular_velocity_z", f32),
+    ("angular_acceleration_x", f32), ("angular_acceleration_y", f32),
+    ("angular_acceleration_z", f32), ("front_wheels_angle", f32),
+  ]
+
+
+# m_surfaceType values that mean the car is off the track
+OFF_TRACK_SURFACES = {3, 4, 5, 6, 7, 8}  # rock, gravel, mud, sand, grass, water
+
+
 class CarDamageData2024(_S):
   _fields_ = [
     ("tyres_wear", f32 * 4), ("tyres_damage", u8 * 4), ("brakes_damage", u8 * 4),
@@ -246,9 +265,16 @@ def _ms_min(ms, minutes):
 
 
 class F1Accumulator:
-  """Collects packets into one dashboard/analysis frame for all cars."""
+  """Collects packets into one dashboard/analysis frame for all cars.
 
-  def __init__(self):
+  `on_player_sample(sample: dict)` — optional callback, called once per Car Telemetry
+  packet with a high-rate snapshot of the player's car for the driving coach.
+  `on_session(info: dict)` — optional callback when a new session starts or the track changes.
+  """
+
+  def __init__(self, on_player_sample=None, on_session=None):
+    self.on_player_sample = on_player_sample
+    self.on_session = on_session
     self._reset()
 
   def _reset(self):
@@ -268,6 +294,11 @@ class F1Accumulator:
     self.rain_percent = 0
     self.safety_car = 0
     self.pit_window = (0, 0)
+    self.track_length = 0
+    self.session_time = 0.0
+    self.player_lap = {}   # latest lap-data fields for the player
+    self.player_ex = None  # latest MotionEx (slip per wheel) for the player
+    self._session_announced = None
 
   def feed(self, data: bytes, player_idx: int | None = None):
     if len(data) < HEADER_SIZE:
@@ -277,6 +308,7 @@ class F1Accumulator:
     if self.session_uid is not None and header.session_uid != self.session_uid:
       self._reset()  # new session: forget stale cars
     self.session_uid = header.session_uid
+    self.session_time = header.session_time
 
     lay = layouts(header.packet_format)
     self.packet_format = lay["format"]
@@ -287,6 +319,7 @@ class F1Accumulator:
       0: self._parse_motion, 1: self._parse_session, 2: self._parse_lap_data,
       4: self._parse_participants, 6: self._parse_car_telemetry,
       7: self._parse_car_status, 10: self._parse_car_damage,
+      13: self._parse_motion_ex,
     }.get(header.packet_id)
     if handler is None:
       return None  # events, setups, history, lobby, etc.
@@ -328,6 +361,17 @@ class F1Accumulator:
     self.track_id = s.track_id
     self.safety_car = s.safety_car_status
     self.pit_window = (s.pit_stop_window_ideal_lap, s.pit_stop_window_latest_lap)
+    self.track_length = s.track_length
+    key = (self.session_uid, s.track_id, s.session_type)
+    if key != self._session_announced:
+      self._session_announced = key
+      if self.on_session:
+        self.on_session({
+          "session_uid": self.session_uid, "track_id": s.track_id,
+          "track": TRACK_NAMES.get(s.track_id, f"Track-{s.track_id}"),
+          "track_length": s.track_length, "total_laps": s.total_laps,
+          "session": SESSION_TYPES.get(s.session_type, "Unknown"),
+        })
     # Rain chance "now": first forecast sample for this session
     rain = 0
     for k in range(min(s.num_weather_forecast_samples, 64)):
@@ -359,6 +403,12 @@ class F1Accumulator:
       car["resultStatus"] = ld.result_status
       if i == self.player_idx:
         self.lap = ld.current_lap_num
+        self.player_lap = {
+          "lap": ld.current_lap_num, "dist": ld.lap_distance,
+          "lap_ms": ld.current_lap_time_in_ms, "last_lap_ms": ld.last_lap_time_in_ms,
+          "invalid": bool(ld.current_lap_invalid), "pit": ld.pit_status != 0,
+          "sector": ld.sector,
+        }
 
     by_pos = {c.get("position"): idx for idx, c in self.cars.items() if c.get("position")}
     for c in self.cars.values():
@@ -394,6 +444,39 @@ class F1Accumulator:
         },
         "tirePressures": _wheels(t.tyres_pressure, lambda v: round(v, 1)),
       })
+      if i == self.player_idx and self.on_player_sample and self.player_lap:
+        self._emit_player_sample(t, car)
+
+  def _emit_player_sample(self, t, car):
+    pl, ex = self.player_lap, self.player_ex
+    sample = {
+      "t": self.session_time,
+      "lap": pl["lap"], "dist": pl["dist"], "lap_ms": pl["lap_ms"],
+      "last_lap_ms": pl["last_lap_ms"], "invalid": pl["invalid"], "pit": pl["pit"],
+      "speed": t.speed, "throttle": t.throttle, "brake": t.brake, "steer": t.steer,
+      "gear": t.gear,
+      "surface": [t.surface_type[j] for j in range(4)],
+      "tyre_surface": [t.tyres_surface_temperature[j] for j in range(4)],
+      "x": car.get("x"), "z": car.get("z"),
+      "wear": car.get("tireWear"),            # {"RL": %, ...} from the damage packet
+      "compound": car.get("compound"),
+      # RL, RR, FL, FR — None when MotionEx isn't arriving
+      "slip_ratio": list(ex["slip_ratio"]) if ex else None,
+      "slip_angle": list(ex["slip_angle"]) if ex else None,
+    }
+    try:
+      self.on_player_sample(sample)
+    except Exception as e:  # never let coaching break telemetry
+      print(f"[coach] sample error: {e}")
+
+  def _parse_motion_ex(self, data, lay):
+    if len(data) < HEADER_SIZE + ctypes.sizeof(MotionExPrefix):
+      return
+    m = MotionExPrefix.from_buffer_copy(data, HEADER_SIZE)
+    self.player_ex = {
+      "slip_ratio": [m.wheel_slip_ratio[j] for j in range(4)],
+      "slip_angle": [m.wheel_slip_angle[j] for j in range(4)],
+    }
 
   def _parse_car_status(self, data, lay):
     for i, s in self._each_car(data, lay["status"]):

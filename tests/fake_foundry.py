@@ -39,7 +39,9 @@ async def chat(deployment: str, request: Request):
       "message": "Unrecognized request argument supplied: reasoning_effort",
       "type": "invalid_request_error", "param": "reasoning_effort", "code": None}})
   system = body["messages"][0]["content"]
-  if "team radio" in system:
+  if "coaching call" in system:
+    content = {"voice": "Corner 3, brake at your marker and carry the apex speed."}
+  elif "team radio" in system:
     content = {"voice": "Tyres are fine, 9 laps old, box window opens lap 18."}
   else:
     content = {"advice": "[L12/57] Race | LightRain\nL12 | STAY OUT | fronts 30%", "voice": "Stay out, fronts at 30 percent."}
