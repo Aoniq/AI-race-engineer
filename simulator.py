@@ -283,14 +283,20 @@ async def connect_and_send():
           payload = {
             "cars": cars,
             "track": {
-              "id": 6,
+              "id": 7,
               "name": "Silverstone",
-              "weather": "Dry",
+              "weather": "Clear",
+              "rainPercent": 0,
               "trackTemp": 32,
               "airTemp": 28,
+              "totalLaps": 52,
+              "session": "Race",
+              "safetyCar": "",
+              "pitWindow": [18, 26],
             },
             "player_idx": 19,
             "lap": lap,
+            "game": "Simulator",
           }
 
           await ws.send(json.dumps(payload, ensure_ascii=False))

@@ -16,7 +16,7 @@ from enum import Enum
 # ============================================================================
 
 class TireCompound(str, Enum):
-    C0 = "C0"; C1 = "C1"; C2 = "C2"; C3 = "C3"; C4 = "C4"; C5 = "C5"
+    C0 = "C0"; C1 = "C1"; C2 = "C2"; C3 = "C3"; C4 = "C4"; C5 = "C5"; C6 = "C6"
     SOFT = "SOFT"; MEDIUM = "MEDIUM"; HARD = "HARD"
     INTER = "INTER"; WET = "WET"
     UNKNOWN = "UNKNOWN"
@@ -54,6 +54,8 @@ _COMPOUND_DEFAULTS: dict[str, CompoundParams] = {
     "C3": CompoundParams(0.025, 0.00035, 1.60, 0.28,  90, 7.50, 100, 110, 80, 20, 0.92, 1.60),
     "C4": CompoundParams(0.030, 0.00050, 1.75, 0.32,  90, 6.25,  97, 105, 80, 16, 0.90, 1.75),
     "C5": CompoundParams(0.035, 0.00070, 1.90, 0.36,  85, 7.50,  95, 105, 75, 12, 0.88, 1.90),
+    # F1 25 adds C6, softer than C5: shorter life, earlier overheating (estimated)
+    "C6": CompoundParams(0.040, 0.00090, 2.00, 0.38,  85, 7.00,  93, 103, 75, 10, 0.86, 2.00),
     "SOFT":  CompoundParams(0.030, 0.00050, 1.75, 0.32, 90, 6.25, 97, 105, 80, 16, 0.90, 1.75),
     "MEDIUM": CompoundParams(0.025, 0.00035, 1.60, 0.28, 90, 7.50, 100, 110, 80, 20, 0.92, 1.60),
     "HARD":  CompoundParams(0.015, 0.00018, 1.45, 0.22, 100, 8.75, 110, 120, 85, 30, 0.94, 1.45),
@@ -241,6 +243,13 @@ def evaluate_fuel(car: dict, race_laps: int | None = None, current_lap: int | No
         must_save = margin < FUEL_SAVE_THRESHOLD
         can_push = margin > FUEL_PUSH_THRESHOLD
 
+    # F1 25 reports its own fuel margin in laps (+ = spare): more accurate than our estimate
+    game_margin = car.get("fuelLapsLeft")
+    if game_margin is not None and (fuel_kg or 0) > 0:
+        margin = float(game_margin)
+        must_save = margin < FUEL_SAVE_THRESHOLD
+        can_push = margin > FUEL_PUSH_THRESHOLD
+
     # 油量对圈速的影响
     fuel_effect = FUEL_S_PER_KG * (fuel_kg - FUEL_REFERENCE_KG) if fuel_kg is not None else None
 
@@ -299,9 +308,14 @@ def evaluate_opponent_threat(player: dict, opponent: dict) -> OpponentThreat:
     """评估单个对手的威胁。"""
     car_idx = opponent.get("idx", -1)
     name = opponent.get("name", f"#{car_idx}")
-    gap = opponent.get("gapToAhead") if opponent.get("position", 99) > player.get("position", 99) else opponent.get("gapToBehind")
-    if gap is None:
-        gap = opponent.get("gapToLeader", 0) - player.get("gapToLeader", 0)
+    # Gap to the player (+ = opponent behind), from both cars' gap to the leader
+    opp_lead = opponent.get("gapToLeader")
+    me_lead = player.get("gapToLeader")
+    gap = None
+    if opp_lead is not None and me_lead is not None:
+        gap = opp_lead - me_lead
+        if gap == 0 and opponent.get("position") != 1 and player.get("position") != 1:
+            gap = None  # no timing yet (e.g. first lap)
 
     # 圈速差
     opp_lap = opponent.get("bestLapTime")
@@ -386,7 +400,14 @@ PACE_LOSS_AT_ZERO_GRIP = 1.5
 def evaluate_weather(track: dict) -> WeatherResult:
     """评估天气状况。"""
     weather = track.get("weather", {})
-    rain_percent = weather.get("rain_percent", 0)
+    if isinstance(weather, dict):
+        rain_percent = weather.get("rain_percent", 0)
+    else:
+        # F1 parser: weather is a name, rain chance comes from the session forecast
+        rain_percent = track.get("rainPercent") or 0
+        rain_percent = max(rain_percent, {
+            "LightRain": 35, "HeavyRain": 70, "Storm": 90,
+        }.get(str(weather), 0))
     intensity = _clamp(rain_percent / 100.0, 0.0, 1.0) if rain_percent else 0.0
 
     # 湿度分类
@@ -428,9 +449,17 @@ class TelemetryAnalysis:
     race_situation: str       # 格式化的赛况摘要
 
 
+def find_player(cars: list[dict], player_idx: int) -> dict:
+    """The player's car by car index (cars may be a filtered list)."""
+    for c in cars:
+        if c.get("idx") == player_idx:
+            return c
+    return cars[player_idx] if 0 <= player_idx < len(cars) else {}
+
+
 def analyze_telemetry_frame(cars: list[dict], player_idx: int, lap: int, track: dict) -> TelemetryAnalysis:
     """对一帧遥测数据运行所有物理模型。"""
-    player = cars[player_idx] if 0 <= player_idx < len(cars) else {}
+    player = find_player(cars, player_idx)
 
     # 轮胎
     tire = evaluate_tire(player)
@@ -443,7 +472,7 @@ def analyze_telemetry_frame(cars: list[dict], player_idx: int, lap: int, track: 
 
     # 对手威胁 (取前5名最近的对手)
     threats = []
-    for car in cars:
+    for car in cars if player else []:
         if car.get("idx") == player_idx:
             continue
         t = evaluate_opponent_threat(player, car)
@@ -464,7 +493,7 @@ def analyze_telemetry_frame(cars: list[dict], player_idx: int, lap: int, track: 
         f"P{pos} | {speed}km/h | DRS {drs} | ERS {ers:.0f}%\n"
         f"Tire: {tire.compound} L{tire.age_laps} | grip={tire.grip_factor:.2f} | "
         f"health={tire.health_score:.0f}% | loss={tire.performance_loss_s:.2f}s\n"
-        f"Fuel: {player.get('fuel', 0):.1f}L | margin={fuel.fuel_margin_laps or 'n/a'} laps | "
+        f"Fuel: {player.get('fuel', 0):.1f}kg | margin={fuel.fuel_margin_laps or 'n/a'} laps | "
         f"{'CAN PUSH' if fuel.can_push else 'MUST SAVE' if fuel.must_save else 'OK'}\n"
         f"Gap: ahead +{gap_ahead:.1f}s | behind -{gap_behind:.1f}s\n"
         f"Weather: {weather.wetness} | grip={weather.grip_level:.2f} | pace_loss={weather.pace_loss_s:.2f}s"
@@ -493,7 +522,7 @@ def format_analysis_for_llm(analysis: TelemetryAnalysis, cars: list[dict], playe
         f"  Tire loss: {t.performance_loss_s:.3f}s | deg_rate: {t.deg_rate_s_per_lap:.4f}s/lap",
         f"  Remaining laps: {t.remaining_laps:.1f} | limiting: {t.limiting_budget}",
         f"  Overheat risk: {t.overheat_risk.value}",
-        f"  Fuel: {f.consumption_kg_per_lap:.2f}kg/lap | margin: {f.fuel_margin_laps or 'n/a'} laps",
+        f"  Fuel: {f.consumption_kg_per_lap:.2f}kg/lap | margin: {f.fuel_margin_laps if f.fuel_margin_laps is not None else 'n/a'} laps",
         f"  Fuel effect: {f.fuel_effect_s or 0:.3f}s | push={f.can_push} save={f.must_save}",
         f"  Weather grip: {w.grip_level:.3f} | pace_loss: {w.pace_loss_s:.3f}s | wetness: {w.wetness}",
         "",
@@ -502,7 +531,7 @@ def format_analysis_for_llm(analysis: TelemetryAnalysis, cars: list[dict], playe
 
     for th in analysis.opponent_threats:
         lines.append(
-            f"  P{th.car_idx} {th.name}: threat={th.threat_level}({th.threat_score:.0f}) "
+            f"  {th.name}: threat={th.threat_level}({th.threat_score:.0f}) "
             f"gap={th.gap_to_player or 'n/a'}s pace_delta={th.pace_delta or 'n/a'}s "
             f"catch={th.laps_to_catch or 'n/a'} laps | {', '.join(th.factors) if th.factors else 'no pressure'}"
         )

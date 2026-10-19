@@ -1,27 +1,20 @@
 """
-DeepSeek real-time strategy analysis — sends all 22 cars to the AI.
-Integrates physics engine models (tire, fuel, ERS, weather, opponent) for precise data.
+Real-time strategy analysis on Microsoft Foundry — sends the whole field to the chat model.
+The physics models (tire, fuel, ERS, weather, opponent) run first so the model reasons
+over computed numbers instead of guessing them.
 """
-import os, json
-from openai import OpenAI
-from dotenv import load_dotenv
-from engine_models import (
-    analyze_telemetry_frame,
-    format_analysis_for_llm,
-    TireResult,
-    FuelResult,
-    OpponentThreat,
+import json
+from engine_models import analyze_telemetry_frame, format_analysis_for_llm, find_player
+from foundry import (
+    chat_json,
+    RADIO_LANGUAGE_NAME,
+    STRATEGY_REASONING,
+    RADIO_REASONING,
 )
 
-load_dotenv()
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url=os.getenv("DEEPSEEK_BASE_URL"),
-)
+SYSTEM_PROMPT = """# F1 25 Strategy Engineer AI — System Instructions
 
-SYSTEM_PROMPT = """# F1 24 Strategy Engineer AI — System Instructions
-
-You are the pit-wall strategy engineer for F1 24. Your input is live telemetry for all cars (JSON). Your output is tactical advice for the driver, global situational awareness, and lap-time comparison.
+You are the pit-wall strategy engineer for F1 25. Your input is live telemetry for all cars (JSON). Your output is tactical advice for the driver, global situational awareness, and lap-time comparison.
 
 ---
 
@@ -39,7 +32,7 @@ You are the strategy brain between the driver and the team. You do not drive the
 ## Output Requirements
 
 Output strategy advice in the format below. **No disclaimers or meta commentary.**
-Return JSON only: {"advice": "...", "voice": "..."}. Use English in advice.
+Return JSON only: {"advice": "...", "voice": "..."}. Write both fields in {LANG}.
 
 ### 1) Race Situation
 
@@ -126,12 +119,14 @@ Priority order:
   - advice: full analysis (situation/laps/tires/tactics) for the screen
   - voice: one short order for the player only (<20 words), for TTS. Example: {"advice": "L3/57...", "voice": "BOX IN 2 LAPS, fronts 78%"}
   - voice must only address the player car, never other drivers
-- Use English"""
+- Write in {LANG}
+- Tyre compounds go from C6 (softest) to C0 (hardest); `fuelLapsLeft` is the game's own fuel margin in laps (+ = spare)
+- Respect the pit window from the session data and any SC/VSC (cheap pit stop)""".replace("{LANG}", RADIO_LANGUAGE_NAME)
 
 
-RADIO_SYSTEM_PROMPT = """Race engineer on live team radio. Answer the driver using the telemetry JSON.
-Rules: English only. Max 18 words. Direct radio style. No filler. No JSON keys except voice.
-Return: {"voice":"..."}
+RADIO_SYSTEM_PROMPT = f"""Race engineer on live team radio in F1 25. Answer the driver using the telemetry JSON.
+Rules: {RADIO_LANGUAGE_NAME} only. Max 18 words. Direct radio style. No filler. Use only numbers present in the JSON.
+Return: {{"voice":"..."}}
 """
 
 
@@ -159,38 +154,37 @@ def _slim_car(c: dict) -> dict:
         "ers": c.get("ersBattery"),
         "dmg": c.get("damage"),
         "best": c.get("bestLapTime"),
+        "last": c.get("lastLapTime"),
+        "fuelLaps": c.get("fuelLapsLeft"),
+        "ersMode": c.get("ersMode"),
+        "pit": c.get("pitStatus") or None,
+        "stops": c.get("pitStops"),
     }
 
 
 def analyze(cars: list, player_idx: int, lap: int, track: dict = None) -> dict:
     try:
-        # 先运行物理模型，获取精确数据
-        track_data = track or {"weather": {}, "name": "Unknown"}
+        # Run the physics models first so the LLM gets computed numbers
+        track_data = track or {"name": "Unknown"}
         engine_analysis = analyze_telemetry_frame(cars, player_idx, lap, track_data)
         engine_summary = format_analysis_for_llm(engine_analysis, cars, player_idx, lap)
 
-        # 将物理模型结果附加到用户输入
         user_content = (
             f"PHYSICS ENGINE ANALYSIS:\n{engine_summary}\n\n"
-            f"RAW TELEMETRY:\n{json.dumps({'player_idx': player_idx, 'lap': lap, 'cars': cars}, ensure_ascii=False)}"
+            f"SESSION: {json.dumps(track_data, ensure_ascii=False)}\n\n"
+            f"RAW TELEMETRY:\n{json.dumps({'player_idx': player_idx, 'lap': lap, 'cars': cars}, ensure_ascii=False, separators=(',', ':'))}"
         )
 
-        resp = client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_content}
-            ],
-            response_format={"type": "json_object"},
-            timeout=60
+        result = chat_json(
+            SYSTEM_PROMPT, user_content,
+            max_tokens=4000, timeout=60, reasoning_effort=STRATEGY_REASONING,
         )
-        result = json.loads(resp.choices[0].message.content)
         return {
             "advice": result.get("advice", ""),
             "voice": result.get("voice", ""),
         }
     except Exception as e:
-        print(f"DeepSeek analysis failed: {e}")
+        print(f"Foundry strategy analysis failed: {e}")
         return {"advice": "", "voice": ""}
 
 
@@ -201,72 +195,69 @@ def radio_reply(message: str, cars: list, player_idx: int, lap: int, track: dict
         return {"reply": "", "voice": ""}
 
     cars_list = cars if isinstance(cars, list) else []
-    player = None
-    if 0 <= player_idx < len(cars_list):
-        player = cars_list[player_idx]
-    else:
-        for c in cars_list:
-            if c.get("idx") == player_idx:
-                player = c
-                break
+    player = find_player(cars_list, player_idx) or None
 
-    # 运行物理模型获取精确数据
-    track_data = track or {"weather": {}, "name": "Unknown"}
-    if isinstance(track_data, dict) and "name" in track_data:
-        track_data = {"weather": {}, **track_data}
-    engine_analysis = analyze_telemetry_frame(cars_list, player_idx, lap, track_data)
+    track_data = track if isinstance(track, dict) else {"name": str(track or "Unknown")}
 
-    # Compact standings only — full 22-car blobs slow the LLM a lot
+    # Compact standings only — the full 22/24-car blob slows the model down a lot
     slim = sorted((_slim_car(c) for c in cars_list), key=lambda x: x.get("pos") or 99)
     payload = {
         "msg": message,
         "lap": lap,
-        "track": (track or {}).get("name") if isinstance(track, dict) else track,
+        "track": track_data.get("name"),
+        "totalLaps": track_data.get("totalLaps"),
+        "session": track_data.get("session"),
+        "weather": track_data.get("weather"),
+        "rain%": track_data.get("rainPercent"),
+        "safetyCar": track_data.get("safetyCar") or None,
+        "pitWindow": track_data.get("pitWindow"),
         "you": _slim_car(player) if player else {"idx": player_idx},
         "field": slim[:12],
-        # 物理模型精确数据
-        "physics": {
-            "tire": {
-                "compound": engine_analysis.player_tire.compound,
-                "age": engine_analysis.player_tire.age_laps,
-                "grip": engine_analysis.player_tire.grip_factor,
-                "health": engine_analysis.player_tire.health_score,
-                "loss_s": engine_analysis.player_tire.performance_loss_s,
-                "remaining_laps": engine_analysis.player_tire.remaining_laps,
-                "deg_rate": engine_analysis.player_tire.deg_rate_s_per_lap,
-                "overheat": engine_analysis.player_tire.overheat_risk.value,
-            },
-            "fuel": {
-                "margin_laps": engine_analysis.player_fuel.fuel_margin_laps,
-                "can_push": engine_analysis.player_fuel.can_push,
-                "must_save": engine_analysis.player_fuel.must_save,
-                "effect_s": engine_analysis.player_fuel.fuel_effect_s,
-            },
-            "threats": [
-                {"name": t.name, "level": t.threat_level, "gap": t.gap_to_player, "pace_delta": t.pace_delta}
-                for t in engine_analysis.opponent_threats[:3]
-            ],
-        },
+        "physics": _radio_physics(cars_list, player_idx, lap, track_data),
     }
 
     try:
-        resp = client.chat.completions.create(
-            model="deepseek-v4-flash",
-            messages=[
-                {"role": "system", "content": RADIO_SYSTEM_PROMPT},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=60,
-            temperature=0.3,
-            timeout=20,
+        result = chat_json(
+            RADIO_SYSTEM_PROMPT,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            max_tokens=600, timeout=20, reasoning_effort=RADIO_REASONING,
         )
-        result = json.loads(resp.choices[0].message.content)
         voice = (result.get("voice") or result.get("reply") or result.get("advice") or "").strip()
         return {"reply": voice, "voice": voice}
     except Exception as e:
-        print(f"DeepSeek radio reply failed: {e}")
+        print(f"Foundry radio reply failed: {e}")
         return {
             "reply": "Say again, radio copy lost.",
             "voice": "Say again, radio copy lost.",
         }
+
+
+def _radio_physics(cars_list, player_idx, lap, track_data) -> dict:
+    """Compact physics-model summary for the radio prompt."""
+    try:
+        engine_analysis = analyze_telemetry_frame(cars_list, player_idx, lap, track_data)
+    except Exception as e:
+        print(f"Physics models failed: {e}")
+        return {}
+    return {
+        "tire": {
+            "compound": engine_analysis.player_tire.compound,
+            "age": engine_analysis.player_tire.age_laps,
+            "grip": engine_analysis.player_tire.grip_factor,
+            "health": engine_analysis.player_tire.health_score,
+            "loss_s": engine_analysis.player_tire.performance_loss_s,
+            "remaining_laps": engine_analysis.player_tire.remaining_laps,
+            "deg_rate": engine_analysis.player_tire.deg_rate_s_per_lap,
+            "overheat": engine_analysis.player_tire.overheat_risk.value,
+        },
+        "fuel": {
+            "margin_laps": engine_analysis.player_fuel.fuel_margin_laps,
+            "can_push": engine_analysis.player_fuel.can_push,
+            "must_save": engine_analysis.player_fuel.must_save,
+            "effect_s": engine_analysis.player_fuel.fuel_effect_s,
+        },
+        "threats": [
+            {"name": t.name, "level": t.threat_level, "gap": t.gap_to_player, "pace_delta": t.pace_delta}
+            for t in engine_analysis.opponent_threats[:3]
+        ],
+    }

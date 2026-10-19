@@ -1,17 +1,19 @@
 """
-Telemetry → DeepSeek analysis → TTS → broadcast to frontend
-Supports: UDP (PS5) + WebSocket (simulator fallback)
+Telemetry → Foundry strategy analysis → Foundry TTS → broadcast to frontend.
+Driver pit radio: browser mic → Foundry STT → Foundry chat → Foundry TTS.
+Supports: F1 25 UDP (PC/PS5/Xbox), GT7 JSON over UDP, WebSocket simulator fallback.
 """
 import asyncio, json, time, os, webbrowser, threading, urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, File, UploadFile, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 from analyzer import analyze, radio_reply
 from tts_bridge import synthesize
+from foundry import transcribe, CHAT_DEPLOYMENT, TTS_DEPLOYMENT, STT_DEPLOYMENT, client as foundry_client
 from f1_parser import F1Accumulator
 
 load_dotenv()
@@ -23,6 +25,7 @@ UDP_TIMEOUT = 5.0
 UDP_DEBUG = os.getenv("UDP_DEBUG", "0") == "1"
 UDP_DUMP = os.getenv("UDP_DUMP", "0") == "1"
 ANALYSIS_INTERVAL = float(os.getenv("ANALYSIS_INTERVAL", "15"))
+MAX_RADIO_AUDIO_BYTES = 10 * 1024 * 1024
 
 pit_radios = []
 _last_analysis_time = 0.0
@@ -84,7 +87,8 @@ class F1Protocol(asyncio.DatagramProtocol):
       if now - self._last_summary >= 5.0:
         self._last_summary = now
         counts = ", ".join(f"id{k}:{v}" for k, v in sorted(self._pkt_counts.items()))
-        print(f"[F1 UDP] from={addr[0]} 5s packets=[{counts}] ui_frames={self._frames}")
+        fmt = f1_acc.packet_format or "?"
+        print(f"[F1 UDP] from={addr[0]} format={fmt} 5s packets=[{counts}] ui_frames={self._frames}")
         self._pkt_counts.clear()
         self._frames = 0
     except Exception as e:
@@ -96,13 +100,15 @@ async def lifespan(_app):
   loop = asyncio.get_running_loop()
   print("=== F1 UDP setup ===")
   print(f"Listening F1 telemetry on UDP {UDP_HOST}:{F1_PORT}")
-  print("On PS5 F1 24 Settings → Telemetry:")
+  print("In F1 25: Settings → Telemetry Settings:")
   print("  UDP Telemetry = On")
-  print("  UDP Broadcast / IP = this PC's LAN IP (same Wi‑Fi/LAN as PS5)")
+  print("  UDP Broadcast Mode = Off, UDP IP Address = this PC's LAN IP (127.0.0.1 if F1 25 runs on this PC)")
   print(f"  UDP Port = {F1_PORT}")
-  print("  UDP Send Rate = 20Hz or higher")
+  print("  UDP Send Rate = 20Hz or higher, UDP Format = 2025 (or the 2026 Season Pack format)")
   print("  Then enter a session ON TRACK (menu only sends Event packets).")
   print("====================")
+  print(f"Foundry: chat={CHAT_DEPLOYMENT} tts={TTS_DEPLOYMENT} stt={STT_DEPLOYMENT} "
+        f"({'ready' if foundry_client else 'NOT CONFIGURED'})")
   for name, port, proto in [
     ("GT7", GT7_PORT, Gt7Protocol),
     ("F1", F1_PORT, F1Protocol),
@@ -188,6 +194,7 @@ async def process_frame(data: dict, source: str):
     "track": track,
     "player_idx": player_idx,
     "lap": lap,
+    "game": data.get("game") or ("Simulator" if source == "simulator" else "Live"),
   })
 
   now = time.time()
@@ -212,8 +219,31 @@ class RadioRequest(BaseModel):
 
 @app.post("/api/radio")
 async def api_radio(req: RadioRequest):
-  """Driver speaks to the race engineer; reply is spoken back via TTS."""
-  text = (req.text or "").strip()
+  """Driver types to the race engineer; reply is spoken back via TTS."""
+  return await _answer_driver((req.text or "").strip())
+
+
+@app.post("/api/radio/audio")
+async def api_radio_audio(audio: UploadFile = File(...)):
+  """Driver's recorded pit-radio call → Foundry STT → engineer reply (text + voice)."""
+  data = await audio.read()
+  if not data:
+    return {"ok": False, "error": "empty recording"}
+  if len(data) > MAX_RADIO_AUDIO_BYTES:
+    return {"ok": False, "error": "recording too long"}
+  try:
+    text = await asyncio.to_thread(
+      transcribe, data, audio.filename or "radio.webm", audio.content_type or ""
+    )
+  except Exception as e:
+    print(f"[RADIO] Transcription failed: {e}")
+    return {"ok": False, "error": "transcription failed"}
+  if not text:
+    return {"ok": False, "error": "no speech heard"}
+  return await _answer_driver(text)
+
+
+async def _answer_driver(text: str) -> dict:
   if not text:
     return {"ok": False, "error": "empty message"}
 

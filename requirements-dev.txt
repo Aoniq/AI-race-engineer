@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8
+# Independent F1 25 packet definitions (MIT) used to cross-check f1_parser
+f1-packets==2025.1.1
