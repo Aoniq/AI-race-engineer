@@ -27,8 +27,8 @@
     #standings .st-name { color: #ddd; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #standings .st-gap { color: #777; font-variant-numeric: tabular-nums; text-align: right; }
     #standings .st-tyre { text-align: center; font-size: 10px; font-weight: 700; }
-    #map-wrap { flex: 1; position: relative; background: #0d0d14; min-width: 0; }
-    #map-wrap canvas { display: block; width: 100%; height: 100%; }
+    #map-wrap { flex: 1; position: relative; background: #0d0d14; min-width: 0; min-height: 0; overflow: hidden; }
+    #map-wrap canvas { display: block; position: absolute; inset: 0; width: 100%; height: 100%; }
     #panel {
       width: 320px; background: #12121c; border-left: 1px solid #1e1e2e;
       padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;
@@ -86,6 +86,35 @@
     .engine-row .ev.good { color: #3fb950; }
     .engine-row .ev.warn { color: #d29922; }
     .engine-row .ev.crit { color: #f85149; }
+    #coach-panel {
+      background: #0c1210; color: #c9d1d9; padding: 8px 14px;
+      border-top: 1px solid #1e2e26; flex-shrink: 0;
+      max-height: 26vh; overflow-y: auto; font-size: 12px; line-height: 1.4;
+    }
+    #coach-panel h3 {
+      color: #3fb950; font-size: 11px; text-transform: uppercase; margin: 0 0 6px 0;
+      display: flex; justify-content: space-between; cursor: pointer; user-select: none;
+    }
+    #coach-panel h3 .meta { color: #6e7681; text-transform: none; font-weight: normal; }
+    #coach-panel.collapsed #coach-body { display: none; }
+    #coach-body { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; }
+    @media (max-width: 900px) { #coach-body { grid-template-columns: 1fr; } }
+    .coach-item { padding: 2px 0 2px 8px; border-left: 2px solid #30363d; margin-bottom: 3px; }
+    .coach-item.loss { border-left-color: #f85149; }
+    .coach-item.tyre { border-left-color: #d29922; }
+    .coach-item .k { color: #8b949e; font-size: 10px; text-transform: uppercase; margin-right: 6px; }
+    .coach-sub { color: #6e7681; font-size: 10px; text-transform: uppercase; margin: 6px 0 3px; }
+    .coach-sub:first-child { margin-top: 0; }
+    .corner-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .corner-chip {
+      background: #161b22; border: 1px solid #30363d; border-radius: 4px; padding: 2px 6px;
+      font-size: 11px; font-variant-numeric: tabular-nums;
+    }
+    .corner-chip.good { border-color: #2ea043; color: #7ee787; }
+    .corner-chip.warn { border-color: #9e6a03; color: #e3b341; }
+    .corner-chip.bad { border-color: #da3633; color: #ffa198; }
+    .wear-row { display: flex; gap: 10px; font-variant-numeric: tabular-nums; }
+    .wear-row b.hi { color: #ffa198; }
     #radio-bar {
       display: flex; align-items: center; gap: 10px;
       padding: 8px 14px; background: #0e0e16; border-top: 1px solid #1e1e2e;
@@ -161,13 +190,20 @@
   <h3>Engine Analysis</h3>
   <div id="engine-content"></div>
 </div>
+<div id="coach-panel">
+  <h3 id="coach-head"><span>Driving Coach</span><span class="meta" id="coach-meta">learning the track…</span></h3>
+  <div id="coach-body">
+    <div id="coach-findings"><div class="coach-item">Drive one full flying lap of F1 25 — the coach learns the corners, then compares every lap with your own best through each corner.</div></div>
+    <div id="coach-side"></div>
+  </div>
+</div>
 <div id="radio-bar">
   <button id="ptt-btn" type="button" title="Click or press Space to toggle mic">MIC OFF</button>
   <div id="radio-log">Pit radio ready — ask about tyres, box, gaps, fuel…</div>
   <div id="radio-hint">Space = toggle mic</div>
 </div>
 <div id="status-bar">
-  <span id="status-left">F1 24 · Connecting...</span>
+  <span id="status-left">F1 25 · Connecting...</span>
   <span id="status-right"></span>
 </div>
 
@@ -198,6 +234,9 @@ let playerIdx = -1;
 let selectedIdx = null;
 let currentLap = 0;
 let trackName = "";
+let gameLabel = "F1 25";
+let coachReport = null;
+let coachCorners = [];
 
 // ====== Engine Panel (client-side physics) ======
 function runClientPhysics(cars, playerIdx, lap, track) {
@@ -214,6 +253,7 @@ function runClientPhysics(cars, playerIdx, lap, track) {
   const peakTemp = tireTemps.length ? Math.max(...tireTemps) : null;
 
   const compoundParams = {
+    "C6": { alpha: 0.040, beta: 0.00090, life: 10, t_hot: 93, t_crit: 103, cliff: 0.86 },
     "C5": { alpha: 0.035, beta: 0.00070, life: 12, t_hot: 95, t_crit: 105, cliff: 0.88 },
     "C4": { alpha: 0.030, beta: 0.00050, life: 16, t_hot: 97, t_crit: 105, cliff: 0.90 },
     "C3": { alpha: 0.025, beta: 0.00035, life: 20, t_hot: 100, t_crit: 110, cliff: 0.92 },
@@ -248,7 +288,9 @@ function runClientPhysics(cars, playerIdx, lap, track) {
   // Fuel analysis
   const fuelKg = player.fuel || 0;
   const consumption = 1.6;
-  const fuelMargin = (fuelKg - 1.5) / consumption - Math.max(0, (track.totalLaps || 57) - lap);
+  const fuelMargin = (player.fuelLapsLeft !== undefined && player.fuelLapsLeft !== null && fuelKg > 0)
+    ? player.fuelLapsLeft  // F1 25's own +/- laps estimate
+    : (fuelKg - 1.5) / consumption - Math.max(0, (track.totalLaps || 57) - lap);
   const canPush = fuelMargin > 1.5;
   const mustSave = fuelMargin < 0.5;
 
@@ -481,6 +523,31 @@ function drawMap() {
     strokeSeg(seg, 1.5 * dpr, "rgba(255,255,255,0.5)");
   }
 
+  // Learned corners (driving coach), coloured by last lap's time vs personal best
+  if (coachCorners.length) {
+    const deltas = {};
+    for (const row of (coachReport && coachReport.corner_table) || []) deltas[row.corner] = row.delta;
+    ctx.font = `bold ${10 * dpr}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (const c of coachCorners) {
+      if (c.x === null || c.x === undefined) continue;
+      const [sx, sy] = toScreen(c.x, c.z);
+      const d = deltas[c.corner];
+      const col = d === undefined || d === null ? "#6e7681" : d >= 0.1 ? "#f85149" : d >= 0.03 ? "#d29922" : "#3fb950";
+      ctx.beginPath();
+      ctx.arc(sx, sy, 9 * dpr, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(13,17,23,0.85)";
+      ctx.fill();
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 1.5 * dpr;
+      ctx.stroke();
+      ctx.fillStyle = col;
+      ctx.fillText(c.corner, sx, sy);
+    }
+    ctx.textBaseline = "alphabetic";
+  }
+
   // Cars on track
   const dotR = Math.max(5 * dpr, 7);
   for (const c of allCars) {
@@ -711,17 +778,25 @@ canvas.addEventListener("click", e => {
 // ====== WebSocket ======
 let ws;
 function connect() {
-  statusLeft.textContent = "F1 24 · Connecting...";
+  statusLeft.textContent = `${gameLabel} · Connecting...`;
   statusLeft.style.color = "#555";
   ws = new WebSocket("ws://127.0.0.1:8000/ws/pitradio");
 
   ws.onopen = () => {
-    statusLeft.innerHTML = "F1 24 · <span class='ok'>Connected</span>";
+    statusLeft.innerHTML = `${gameLabel} · <span class='ok'>Connected</span>`;
   };
 
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
 
+    if (d.type === "coaching") {
+      if (d.corners) coachCorners = d.corners;
+      renderCoach(d.report);
+      if (d.voice) radioLog.innerHTML = `<span class="eng">COACH:</span> ${esc(d.voice)}`;
+      if (d.audio_url) enqueueAudio(d.audio_url);
+      drawMap();
+      return;
+    }
     if (!d.cars) {
       if (d.type === "radio") {
         if (d.driver) setRadioLog(d.driver, d.advice || d.voice || "");
@@ -750,6 +825,10 @@ function connect() {
     }
     learnTrack();
     if (d.player_idx !== undefined) playerIdx = d.player_idx;
+    if (d.game && d.game !== gameLabel) {
+      gameLabel = d.game;
+      statusLeft.innerHTML = `${gameLabel} · <span class='ok'>Connected</span>`;
+    }
     if (d.lap !== undefined) currentLap = d.lap;
 
     populateSelect();
@@ -803,7 +882,7 @@ function connect() {
   };
 
   ws.onclose = () => {
-    statusLeft.innerHTML = "F1 24 · <span class='err'>Disconnected</span>";
+    statusLeft.innerHTML = `${gameLabel} · <span class='err'>Disconnected</span>`;
     setTimeout(connect, 3000);
   };
   ws.onerror = () => ws.close();
@@ -848,106 +927,116 @@ async function sendToEngineer(text) {
   }
 }
 
-function initPitRadio() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let recognition = null;
-  let listening = false;
-  let armed = false; // toggle state
+function showTypedRadio(reason) {
+  radioHint.textContent = reason || "Type + Enter";
+  pttBtn.textContent = "TYPE BELOW";
+  if (document.getElementById("radio-input")) return;
+  const input = document.createElement("input");
+  input.id = "radio-input";
+  input.placeholder = "Talk to engineer…";
+  input.style.cssText = "flex:1;min-width:120px;background:#1a1a2a;color:#ddd;border:1px solid #2a2a3a;border-radius:4px;padding:8px 10px;font-size:13px;";
+  radioLog.replaceWith(input);
+  input.addEventListener("keydown", e => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      sendToEngineer(input.value);
+      input.value = "";
+    }
+  });
+  pttBtn.onclick = () => {
+    const t = prompt("Message to engineer:");
+    if (t) sendToEngineer(t);
+  };
+}
 
-  function setIdleUi() {
-    pttBtn.classList.remove("listening", "busy");
+async function sendAudioToEngineer(blob) {
+  pttBtn.classList.add("busy");
+  pttBtn.textContent = "ENGINEER…";
+  setRadioLog("(transcribing…)", "…");
+  try {
+    window.__radioLocalPlay = true;
+    const ext = (blob.type.split("/")[1] || "webm").split(";")[0].replace("x-m4a", "m4a");
+    const form = new FormData();
+    form.append("audio", blob, `radio.${ext === "mp4" ? "m4a" : ext}`);
+    const res = await fetch("/api/radio/audio", { method: "POST", body: form });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || "radio failed");
+    setRadioLog(data.driver || "", data.reply || data.voice || "");
+    if (data.reply) {
+      alertBar.style.display = "block";
+      alertBar.textContent = data.reply;
+    }
+    if (data.audio_url) enqueueAudio(data.audio_url);
+  } catch (err) {
+    console.error(err);
+    window.__radioLocalPlay = false;
+    setRadioLog("", err.message === "no speech heard" ? "Didn't catch that — say again" : "Radio failed — try again");
+  } finally {
+    pttBtn.classList.remove("busy", "listening");
     pttBtn.textContent = "MIC OFF";
     radioHint.textContent = "Space = toggle mic";
   }
+}
 
-  if (!SpeechRecognition) {
-    radioHint.textContent = "Mic unsupported — type + Enter";
-    pttBtn.textContent = "TYPE BELOW";
-    const input = document.createElement("input");
-    input.id = "radio-input";
-    input.placeholder = "Talk to engineer…";
-    input.style.cssText = "flex:1;min-width:120px;background:#1a1a2a;color:#ddd;border:1px solid #2a2a3a;border-radius:4px;padding:8px 10px;font-size:13px;";
-    radioLog.replaceWith(input);
-    input.addEventListener("keydown", e => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        sendToEngineer(input.value);
-        input.value = "";
-      }
-    });
-    pttBtn.onclick = () => {
-      const t = prompt("Message to engineer:");
-      if (t) sendToEngineer(t);
-    };
+function initPitRadio() {
+  // Speech-to-text runs on Microsoft Foundry: the browser only records audio.
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    showTypedRadio("Mic recording unsupported — type + Enter");
     return;
   }
 
-  recognition = new SpeechRecognition();
-  recognition.lang = "en-US";
-  recognition.interimResults = true;
-  recognition.continuous = true;
-  recognition.maxAlternatives = 1;
+  const preferred = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"];
+  const mimeType = preferred.find(t => MediaRecorder.isTypeSupported(t)) || "";
+  let stream = null;
+  let recorder = null;
+  let chunks = [];
+  let startedAt = 0;
 
-  let finalBits = [];
-
-  recognition.onstart = () => {
-    listening = true;
+  async function startMic() {
+    if (pttBtn.classList.contains("busy") || recorder) return;
+    try {
+      if (!stream) {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        });
+      }
+    } catch (err) {
+      console.error(err);
+      showTypedRadio("Mic blocked — allow it, or type + Enter");
+      return;
+    }
+    chunks = [];
+    recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    recorder.ondataavailable = ev => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+    recorder.onstop = () => {
+      const type = recorder.mimeType || mimeType || "audio/webm";
+      const blob = new Blob(chunks, { type });
+      const tooShort = Date.now() - startedAt < 400 || blob.size < 1000;
+      recorder = null;
+      chunks = [];
+      if (tooShort) {
+        pttBtn.classList.remove("listening");
+        pttBtn.textContent = "MIC OFF";
+        radioHint.textContent = "Space = toggle mic";
+        return;
+      }
+      sendAudioToEngineer(blob);
+    };
+    startedAt = Date.now();
+    recorder.start();
     pttBtn.classList.add("listening");
     pttBtn.textContent = "MIC ON — TAP TO SEND";
     radioHint.textContent = "Speak, then Space/click again";
-  };
-
-  recognition.onend = () => {
-    listening = false;
-    if (!armed) {
-      setIdleUi();
-      return;
-    }
-    // Chrome often ends continuous sessions; restart while still armed
-    if (!pttBtn.classList.contains("busy")) {
-      try { recognition.start(); } catch (_) {}
-    }
-  };
-
-  recognition.onerror = (ev) => {
-    if (ev.error === "aborted" || ev.error === "no-speech") return;
-    listening = false;
-    armed = false;
-    setIdleUi();
-    radioLog.textContent = `Mic error: ${ev.error}`;
-  };
-
-  recognition.onresult = (ev) => {
-    let interim = "";
-    for (let i = ev.resultIndex; i < ev.results.length; i++) {
-      const t = ev.results[i][0].transcript;
-      if (ev.results[i].isFinal) finalBits.push(t);
-      else interim += t;
-    }
-    const preview = (finalBits.join(" ") + " " + interim).trim();
-    if (preview) setRadioLog(preview, armed ? "(listening…)" : "");
-  };
-
-  function startMic() {
-    if (pttBtn.classList.contains("busy")) return;
-    armed = true;
-    finalBits = [];
-    try { recognition.start(); } catch (_) {}
+    setRadioLog("(recording…)", "");
   }
 
   function stopMicAndSend() {
-    armed = false;
-    try { recognition.stop(); } catch (_) {}
-    const text = finalBits.join(" ").trim();
-    finalBits = [];
-    pttBtn.classList.remove("listening");
-    if (text) sendToEngineer(text);
-    else setIdleUi();
+    if (recorder && recorder.state !== "inactive") recorder.stop();
   }
 
   function toggleMic() {
     if (pttBtn.classList.contains("busy")) return;
-    if (armed || listening) stopMicAndSend();
+    if (recorder) stopMicAndSend();
     else startMic();
   }
 
@@ -964,11 +1053,79 @@ function initPitRadio() {
   });
 }
 
+// ====== Driving coach ======
+const coachPanel = $("coach-panel");
+const esc = t => String(t ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;");
+$("coach-head").addEventListener("click", () => coachPanel.classList.toggle("collapsed"));
+
+function renderCoach(r) {
+  coachReport = r || null;
+  const meta = $("coach-meta");
+  const findingsEl = $("coach-findings");
+  const side = $("coach-side");
+  if (!r) return;
+  meta.textContent = `Lap ${r.lap} · ${r.lap_time_str} · best ${r.best_lap_str}` +
+    (r.valid ? "" : " · invalid") + (r.time_lost_in_corners > 0 ? ` · ${r.time_lost_in_corners.toFixed(2)}s left on track` : "");
+
+  let html = `<div class="coach-sub">Last lap</div>`;
+  if (!r.findings.length) html += `<div class="coach-item">Clean lap — nothing to fix.</div>`;
+  for (const f of r.findings.slice(0, 5)) {
+    const cls = f.loss_s >= 0.05 ? "loss" : f.tyre ? "tyre" : "";
+    const label = f.kind.replace("_", " ");
+    html += `<div class="coach-item ${cls}"><span class="k">${esc(label)}</span>${esc(f.text)}</div>`;
+  }
+  if (r.focus && r.focus.length) {
+    html += `<div class="coach-sub">Losing time every lap</div><div class="coach-item loss">` +
+      r.focus.map(x => `${esc(x.corner)} ≈ ${x.avg_loss_s.toFixed(2)}s/lap`).join(" · ") + `</div>`;
+  }
+  findingsEl.innerHTML = html;
+
+  let s = `<div class="coach-sub">Corners vs your best</div><div class="corner-chips">`;
+  for (const c of r.corner_table) {
+    const d = c.delta;
+    const cls = d === null ? "" : d >= 0.1 ? "bad" : d >= 0.03 ? "warn" : "good";
+    const txt = d === null ? "—" : (d >= 0 ? "+" : "") + d.toFixed(2);
+    const sgn = v => (v >= 0 ? "+" : "") + v;
+    const tip = [c.brake_m !== null ? `brake ${sgn(c.brake_m)} m` : "", c.apex_kmh !== null ? `apex ${sgn(c.apex_kmh)} km/h` : ""]
+      .filter(Boolean).join(", ");
+    s += `<span class="corner-chip ${cls}" title="${esc(tip)}">${esc(c.corner)} ${txt}</span>`;
+  }
+  s += `</div>`;
+  const t = r.tyre || {};
+  if (t.wear_per_lap) {
+    const w = t.wear_per_lap;
+    const max = Math.max(w.FL, w.FR, w.RL, w.RR);
+    const cell = k => `<span>${k} <b class="${w[k] === max ? "hi" : ""}">${w[k].toFixed(1)}%</b></span>`;
+    s += `<div class="coach-sub">Tyre wear per lap · ${esc(t.limiting_axle || "")} limited</div>` +
+      `<div class="wear-row">${cell("FL")}${cell("FR")}${cell("RL")}${cell("RR")}</div>`;
+  }
+  for (const tip of (t.tips || [])) s += `<div class="coach-item tyre" style="margin-top:4px">${esc(tip.text)}</div>`;
+  if (r.has_slip_data === false) {
+    s += `<div class="coach-sub">No Motion Ex data — lock-ups, wheelspin and slides need UDP Format 2025 at 20Hz+</div>`;
+  }
+  side.innerHTML = s;
+}
+
+async function loadCoaching() {
+  try {
+    const res = await fetch("/api/coaching");
+    const d = await res.json();
+    coachCorners = d.corners || [];
+    if (d.report) renderCoach(d.report);
+    else if (!d.learning) $("coach-meta").textContent = `${coachCorners.length} corners learned — finish a lap`;
+  } catch (_) {}
+}
+
 // ====== Init ======
 window.addEventListener("resize", () => { resizeCanvas(); drawMap(); });
+// Bottom panels appear and grow at runtime: keep the map canvas matched to its box
+if (window.ResizeObserver) {
+  new ResizeObserver(() => { resizeCanvas(); drawMap(); }).observe(canvas.parentElement);
+}
 resizeCanvas();
 connect();
 initPitRadio();
+loadCoaching();
 </script>
 </body>
 </html>

@@ -1,299 +1,574 @@
 """
-F1 24 UDP parser — all 22 cars (official PacketHeader / payload layout).
+F1 25 UDP parser (also accepts F1 24 and the F1 25 "2026 Season Pack" UDP mode).
+
+Struct layouts follow EA's "Data Output from F1 25" specification and are
+selected per packet by the header's m_packetFormat:
+
+  2024  F1 24 UDP                    22 cars, 48-byte names, no tyre blisters
+  2025  F1 25 UDP                    22 cars, 32-byte names, tyre blisters
+  2026  F1 25 2026 Season Pack UDP   24 cars, 16-bit team/driver ids, u8 engine temp,
+                                     int16 g-forces, ERS harvest limit in car status
+
+All per-wheel arrays in the spec are ordered RL, RR, FL, FR.
 """
+from __future__ import annotations
+
+import ctypes
 import math
-import struct
+from functools import lru_cache
 
-# F1 23/24 header: format, year, maj, min, packetVer, packetId, sessionUID, ...
-HEADER_FMT = struct.Struct("<HBBBBBQfIIBB")
-HEADER_SIZE = HEADER_FMT.size  # 29
+WHEELS = ("RL", "RR", "FL", "FR")  # spec order for every [4] array
+SUPPORTED_FORMATS = (2024, 2025, 2026)
+DEFAULT_FORMAT = 2025
 
-MOTION_CAR_FMT = struct.Struct("<3f3f6h6f")  # 60 bytes
-MOTION_CAR_SIZE = MOTION_CAR_FMT.size
-
-CAR_TELE_FMT = struct.Struct("<HfffBbHBBH4H4B4BH4f4B")  # 60 bytes
-CAR_TELE_SIZE = CAR_TELE_FMT.size
-
-CAR_STATUS_CAR_SIZE = 55
-CAR_STATUS_FUEL_OFFSET = 5
-CAR_STATUS_COMPOUND_OFFSET = 25  # m_actualTyreCompound
-CAR_STATUS_ERS_OFFSET = 37  # m_ersStoreEnergy (Joules)
-ERS_MAX_J = 4_000_000.0
-
-CAR_DMG_CAR_SIZE = 42  # float[4] wear + uint8 fields (packed)
-CAR_DMG_WEAR_OFFSET = 0  # 4 × float percentage
-CAR_DMG_FRONT_WING_OFFSET = 24  # after wear(16)+tyreDmg(4)+brakeDmg(4)
-
-# F1 24 LapData is 57 bytes (lastLap/currentLap are uint32 ms)
-LAP_DATA_CAR_SIZE = 57
-
-_wheel_map = ["FL", "FR", "RL", "RR"]
-
-# F1 24 actual compound ids
+# m_actualTyreCompound
 COMPOUND_NAMES = {
+  16: "C5", 17: "C4", 18: "C3", 19: "C2", 20: "C1", 21: "C0", 22: "C6",
   7: "INTER", 8: "WET",
-  9: "DRY", 10: "WET",
-  11: "SS", 12: "S", 13: "M", 14: "H", 15: "WET",
-  16: "C5", 17: "C4", 18: "C3", 19: "C2", 20: "C1", 21: "C0",
-  0: "C0", 1: "C1", 2: "C2", 3: "C3", 4: "C4", 5: "C5",
-  6: "SOFT",
+  9: "DRY", 10: "WET",                           # classic cars
+  11: "SOFT", 12: "SOFT", 13: "MEDIUM", 14: "HARD", 15: "WET",  # F2 (11 = super soft)
+}
+# m_visualTyreCompound (what the driver sees on the sidewall)
+VISUAL_COMPOUND_NAMES = {
+  16: "SOFT", 17: "MEDIUM", 18: "HARD", 7: "INTER", 8: "WET",
+  15: "WET", 19: "SOFT", 20: "SOFT", 21: "MEDIUM", 22: "HARD",
 }
 
 TRACK_NAMES = {
   0: "Melbourne", 1: "Paul Ricard", 2: "Shanghai", 3: "Bahrain",
   4: "Catalunya", 5: "Monaco", 6: "Montreal", 7: "Silverstone",
   8: "Hockenheim", 9: "Hungaroring", 10: "Spa", 11: "Monza",
-  12: "Singapore", 13: "Suzuka", 14: "Abu Dhabi", 15: "Red Bull Ring",
-  16: "Austin", 17: "Interlagos", 18: "Baku", 19: "Miami",
-  20: "Imola", 21: "Mexico City", 22: "Jeddah", 23: "Las Vegas",
-  24: "Losail", 25: "Zandvoort",
+  12: "Singapore", 13: "Suzuka", 14: "Abu Dhabi", 15: "Austin",
+  16: "Interlagos", 17: "Red Bull Ring", 18: "Sochi", 19: "Mexico City",
+  20: "Baku", 21: "Bahrain Short", 22: "Silverstone Short", 23: "Austin Short",
+  24: "Suzuka Short", 25: "Hanoi", 26: "Zandvoort", 27: "Imola",
+  28: "Portimao", 29: "Jeddah", 30: "Miami", 31: "Las Vegas", 32: "Losail",
+  39: "Silverstone Reverse", 40: "Red Bull Ring Reverse", 41: "Zandvoort Reverse",
 }
 
-# Packet IDs that update on-track car state enough to refresh the UI
-_UI_PACKET_IDS = {0, 2, 4, 6, 7, 10}
+WEATHER_NAMES = {
+  0: "Clear", 1: "LightCloud", 2: "Overcast",
+  3: "LightRain", 4: "HeavyRain", 5: "Storm",
+}
+
+SESSION_TYPES = {
+  0: "Unknown", 1: "P1", 2: "P2", 3: "P3", 4: "Short Practice",
+  5: "Q1", 6: "Q2", 7: "Q3", 8: "Short Qualifying", 9: "One-Shot Qualifying",
+  10: "Sprint Shootout 1", 11: "Sprint Shootout 2", 12: "Sprint Shootout 3",
+  13: "Short Sprint Shootout", 14: "One-Shot Sprint Shootout",
+  15: "Race", 16: "Race 2", 17: "Race 3", 18: "Time Trial",
+}
+
+ERS_MODES = {0: "NONE", 1: "MEDIUM", 2: "HOTLAP", 3: "OVERTAKE"}
+PIT_STATUS = {0: "", 1: "PITTING", 2: "IN PIT AREA"}
+ERS_MAX_J = 4_000_000.0
+
+# Packets that change on-track state enough to refresh the dashboard
+_UI_PACKET_IDS = {0, 2, 6, 7, 10}
+
+u8, i8, u16, i16, u32, u64, f32 = (
+  ctypes.c_uint8, ctypes.c_int8, ctypes.c_uint16, ctypes.c_int16,
+  ctypes.c_uint32, ctypes.c_uint64, ctypes.c_float,
+)
+
+
+class _S(ctypes.LittleEndianStructure):
+  _pack_ = 1
+
+
+class PacketHeader(_S):
+  _fields_ = [
+    ("packet_format", u16), ("game_year", u8), ("game_major_version", u8),
+    ("game_minor_version", u8), ("packet_version", u8), ("packet_id", u8),
+    ("session_uid", u64), ("session_time", f32), ("frame_identifier", u32),
+    ("overall_frame_identifier", u32), ("player_car_index", u8),
+    ("secondary_player_car_index", u8),
+  ]
+
+
+HEADER_SIZE = ctypes.sizeof(PacketHeader)  # 29
+
+
+class MarshalZone(_S):
+  _fields_ = [("zone_start", f32), ("zone_flag", i8)]
+
+
+class WeatherForecastSample(_S):
+  _fields_ = [
+    ("session_type", u8), ("time_offset", u8), ("weather", u8),
+    ("track_temperature", i8), ("track_temperature_change", i8),
+    ("air_temperature", i8), ("air_temperature_change", i8),
+    ("rain_percentage", u8),
+  ]
+
+
+class SessionPrefix(_S):
+  """Leading part of PacketSessionData; identical in 2024/2025/2026."""
+  _fields_ = [
+    ("weather", u8), ("track_temperature", i8), ("air_temperature", i8),
+    ("total_laps", u8), ("track_length", u16), ("session_type", u8),
+    ("track_id", i8), ("formula", u8), ("session_time_left", u16),
+    ("session_duration", u16), ("pit_speed_limit", u8), ("game_paused", u8),
+    ("is_spectating", u8), ("spectator_car_index", u8),
+    ("sli_pro_native_support", u8), ("num_marshal_zones", u8),
+    ("marshal_zones", MarshalZone * 21), ("safety_car_status", u8),
+    ("network_game", u8), ("num_weather_forecast_samples", u8),
+    ("weather_forecast_samples", WeatherForecastSample * 64),
+    ("forecast_accuracy", u8), ("ai_difficulty", u8),
+    ("season_link_identifier", u32), ("weekend_link_identifier", u32),
+    ("session_link_identifier", u32), ("pit_stop_window_ideal_lap", u8),
+    ("pit_stop_window_latest_lap", u8), ("pit_stop_rejoin_position", u8),
+  ]
+
+
+class LapData(_S):
+  _fields_ = [
+    ("last_lap_time_in_ms", u32), ("current_lap_time_in_ms", u32),
+    ("sector1_time_ms_part", u16), ("sector1_time_minutes_part", u8),
+    ("sector2_time_ms_part", u16), ("sector2_time_minutes_part", u8),
+    ("delta_to_car_in_front_ms_part", u16), ("delta_to_car_in_front_minutes_part", u8),
+    ("delta_to_race_leader_ms_part", u16), ("delta_to_race_leader_minutes_part", u8),
+    ("lap_distance", f32), ("total_distance", f32), ("safety_car_delta", f32),
+    ("car_position", u8), ("current_lap_num", u8), ("pit_status", u8),
+    ("num_pit_stops", u8), ("sector", u8), ("current_lap_invalid", u8),
+    ("penalties", u8), ("total_warnings", u8), ("corner_cutting_warnings", u8),
+    ("num_unserved_drive_through_pens", u8), ("num_unserved_stop_go_pens", u8),
+    ("grid_position", u8), ("driver_status", u8), ("result_status", u8),
+    ("pit_lane_timer_active", u8), ("pit_lane_time_in_lane_in_ms", u16),
+    ("pit_stop_timer_in_ms", u16), ("pit_stop_should_serve_pen", u8),
+    ("speed_trap_fastest_speed", f32), ("speed_trap_fastest_lap", u8),
+  ]
+
+
+class MotionExPrefix(_S):
+  """Leading part of PacketMotionExData (player car only, packet 13); same in 2024-2026."""
+  _fields_ = [
+    ("suspension_position", f32 * 4), ("suspension_velocity", f32 * 4),
+    ("suspension_acceleration", f32 * 4), ("wheel_speed", f32 * 4),
+    ("wheel_slip_ratio", f32 * 4), ("wheel_slip_angle", f32 * 4),
+    ("wheel_lat_force", f32 * 4), ("wheel_long_force", f32 * 4),
+    ("height_of_cog_above_ground", f32), ("local_velocity_x", f32),
+    ("local_velocity_y", f32), ("local_velocity_z", f32),
+    ("angular_velocity_x", f32), ("angular_velocity_y", f32), ("angular_velocity_z", f32),
+    ("angular_acceleration_x", f32), ("angular_acceleration_y", f32),
+    ("angular_acceleration_z", f32), ("front_wheels_angle", f32),
+  ]
+
+
+# m_surfaceType values that mean the car is off the track
+OFF_TRACK_SURFACES = {3, 4, 5, 6, 7, 8}  # rock, gravel, mud, sand, grass, water
+
+
+class CarDamageData2024(_S):
+  _fields_ = [
+    ("tyres_wear", f32 * 4), ("tyres_damage", u8 * 4), ("brakes_damage", u8 * 4),
+    ("front_left_wing_damage", u8), ("front_right_wing_damage", u8),
+    ("rear_wing_damage", u8), ("floor_damage", u8), ("diffuser_damage", u8),
+    ("sidepod_damage", u8), ("drs_fault", u8), ("ers_fault", u8),
+    ("gear_box_damage", u8), ("engine_damage", u8), ("engine_mguh_wear", u8),
+    ("engine_es_wear", u8), ("engine_ce_wear", u8), ("engine_ice_wear", u8),
+    ("engine_mguk_wear", u8), ("engine_tc_wear", u8), ("engine_blown", u8),
+    ("engine_seized", u8),
+  ]
+
+
+class CarDamageData2025(_S):
+  _fields_ = (
+    CarDamageData2024._fields_[:3]
+    + [("tyre_blisters", u8 * 4)]
+    + CarDamageData2024._fields_[3:]
+  )
+
+
+def _motion_fields(gforce_type):
+  return [
+    ("world_position_x", f32), ("world_position_y", f32), ("world_position_z", f32),
+    ("world_velocity_x", f32), ("world_velocity_y", f32), ("world_velocity_z", f32),
+    ("world_forward_dir_x", i16), ("world_forward_dir_y", i16), ("world_forward_dir_z", i16),
+    ("world_right_dir_x", i16), ("world_right_dir_y", i16), ("world_right_dir_z", i16),
+    ("g_force_lateral", gforce_type), ("g_force_longitudinal", gforce_type),
+    ("g_force_vertical", gforce_type), ("yaw", f32), ("pitch", f32), ("roll", f32),
+  ]
+
+
+def _participant_fields(fmt):
+  id_t = u16 if fmt >= 2026 else u8
+  fields = [
+    ("ai_controlled", u8), ("driver_id", id_t), ("network_id", id_t),
+    ("team_id", id_t), ("my_team", u8), ("race_number", u8), ("nationality", u8),
+    ("name", ctypes.c_char * (48 if fmt <= 2024 else 32)),
+    ("your_telemetry", u8), ("show_online_names", u8), ("tech_level", u16),
+    ("platform", u8),
+  ]
+  if fmt >= 2025:
+    fields += [("num_colours", u8), ("livery_colours", (u8 * 3) * 4)]
+  return fields
+
+
+def _telemetry_fields(fmt):
+  return [
+    ("speed", u16), ("throttle", f32), ("steer", f32), ("brake", f32),
+    ("clutch", u8), ("gear", i8), ("engine_rpm", u16), ("drs", u8),
+    ("rev_lights_percent", u8), ("rev_lights_bit_value", u16),
+    ("brakes_temperature", u16 * 4), ("tyres_surface_temperature", u8 * 4),
+    ("tyres_inner_temperature", u8 * 4),
+    ("engine_temperature", u8 if fmt >= 2026 else u16),
+    ("tyres_pressure", f32 * 4), ("surface_type", u8 * 4),
+  ]
+
+
+def _status_fields(fmt):
+  fields = [
+    ("traction_control", u8), ("anti_lock_brakes", u8), ("fuel_mix", u8),
+    ("front_brake_bias", u8), ("pit_limiter_status", u8), ("fuel_in_tank", f32),
+    ("fuel_capacity", f32), ("fuel_remaining_laps", f32), ("max_rpm", u16),
+    ("idle_rpm", u16), ("max_gears", u8), ("drs_allowed", u8),
+    ("drs_activation_distance", u16), ("actual_tyre_compound", u8),
+    ("visual_tyre_compound", u8), ("tyres_age_laps", u8), ("vehicle_fia_flags", i8),
+    ("engine_power_ice", f32), ("engine_power_mguk", f32), ("ers_store_energy", f32),
+    ("ers_deploy_mode", u8), ("ers_harvested_this_lap_mguk", f32),
+    ("ers_harvested_this_lap_mguh", f32), ("ers_deployed_this_lap", f32),
+  ]
+  if fmt >= 2026:
+    fields.append(("ers_harvest_limit_per_lap", f32))
+  fields.append(("network_paused", u8))
+  return fields
+
+
+def _struct(name, fields):
+  return type(name, (_S,), {"_fields_": fields})
+
+
+@lru_cache(maxsize=None)
+def layouts(fmt: int) -> dict:
+  """Per-car struct classes and car count for a packet format."""
+  if fmt not in SUPPORTED_FORMATS:
+    fmt = 2026 if fmt > 2026 else DEFAULT_FORMAT
+  return {
+    "format": fmt,
+    "num_cars": 24 if fmt >= 2026 else 22,
+    "motion": _struct(f"CarMotion{fmt}", _motion_fields(i16 if fmt >= 2026 else f32)),
+    "lap": LapData,
+    "participant": _struct(f"Participant{fmt}", _participant_fields(fmt)),
+    "telemetry": _struct(f"CarTelemetry{fmt}", _telemetry_fields(fmt)),
+    "status": _struct(f"CarStatus{fmt}", _status_fields(fmt)),
+    "damage": CarDamageData2024 if fmt <= 2024 else CarDamageData2025,
+  }
+
+
+def _wheels(arr, fn=lambda v: v):
+  return {WHEELS[j]: fn(arr[j]) for j in range(4)}
+
+
+def _ms_min(ms, minutes):
+  return round((minutes * 60000 + ms) / 1000.0, 3)
 
 
 class F1Accumulator:
-  def __init__(self):
+  """Collects packets into one dashboard/analysis frame for all cars.
+
+  `on_player_sample(sample: dict)` — optional callback, called once per Car Telemetry
+  packet with a high-rate snapshot of the player's car for the driving coach.
+  `on_session(info: dict)` — optional callback when a new session starts or the track changes.
+  """
+
+  def __init__(self, on_player_sample=None, on_session=None):
+    self.on_player_sample = on_player_sample
+    self.on_session = on_session
     self._reset()
 
   def _reset(self):
-    self.cars = {}
+    self.cars: dict[int, dict] = {}
+    self.session_uid = None
+    self.packet_format = None
+    self.num_cars = 22
+    self.num_active = None
     self.player_idx = 0
     self.track_id = -1
     self.lap = 0
+    self.total_laps = 0
     self.session_type = 0
     self.weather = 0
     self.track_temp = 0
     self.air_temp = 0
+    self.rain_percent = 0
+    self.safety_car = 0
+    self.pit_window = (0, 0)
+    self.track_length = 0
+    self.session_time = 0.0
+    self.player_lap = {}   # latest lap-data fields for the player
+    self.player_ex = None  # latest MotionEx (slip per wheel) for the player
+    self._session_announced = None
 
   def feed(self, data: bytes, player_idx: int | None = None):
     if len(data) < HEADER_SIZE:
       return None
+    header = PacketHeader.from_buffer_copy(data, 0)
 
-    header = HEADER_FMT.unpack_from(data, 0)
-    packet_format = header[0]
-    packet_id = header[5]
-    if player_idx is None:
-      player_idx = header[10]
-    self.player_idx = player_idx
+    if self.session_uid is not None and header.session_uid != self.session_uid:
+      self._reset()  # new session: forget stale cars
+    self.session_uid = header.session_uid
+    self.session_time = header.session_time
 
-    if packet_format not in (2023, 2024, 2025):
-      # Still try — some builds may differ; offsets assume 23+ header
-      pass
+    lay = layouts(header.packet_format)
+    self.packet_format = lay["format"]
+    self.num_cars = lay["num_cars"]
+    self.player_idx = header.player_car_index if player_idx is None else player_idx
 
-    if packet_id == 0:
-      self._parse_motion(data)
-    elif packet_id == 1:
-      self._parse_session(data)
-    elif packet_id == 2:
-      self._parse_lap_data(data)
-    elif packet_id == 4:
-      self._parse_participants(data)
-    elif packet_id == 6:
-      self._parse_car_telemetry(data)
-    elif packet_id == 7:
-      self._parse_car_status(data)
-    elif packet_id == 10:
-      self._parse_car_damage(data)
-    else:
-      # Event / lobby / history etc. — no UI frame
+    handler = {
+      0: self._parse_motion, 1: self._parse_session, 2: self._parse_lap_data,
+      4: self._parse_participants, 6: self._parse_car_telemetry,
+      7: self._parse_car_status, 10: self._parse_car_damage,
+      13: self._parse_motion_ex,
+    }.get(header.packet_id)
+    if handler is None:
+      return None  # events, setups, history, lobby, etc.
+    handler(data, lay)
+
+    if header.packet_id not in _UI_PACKET_IDS or not self.cars:
       return None
-
-    if packet_id not in _UI_PACKET_IDS:
-      return None
-    if not self.cars:
-      return None
-
     return self._build_frame()
 
-  def _parse_motion(self, data):
-    for i in range(22):
-      offset = HEADER_SIZE + i * MOTION_CAR_SIZE
-      if offset + MOTION_CAR_SIZE > len(data):
+  # -- helpers ---------------------------------------------------------------
+
+  def _each_car(self, data, cls, base_offset=HEADER_SIZE):
+    size = ctypes.sizeof(cls)
+    for i in range(self.num_cars):
+      off = base_offset + i * size
+      if off + size > len(data):
         break
-      raw = MOTION_CAR_FMT.unpack_from(data, offset)
+      yield i, cls.from_buffer_copy(data, off)
+
+  # -- packet handlers -------------------------------------------------------
+
+  def _parse_motion(self, data, lay):
+    for i, m in self._each_car(data, lay["motion"]):
       car = self.cars.setdefault(i, {})
-      car["x"] = round(raw[0], 1)
-      car["z"] = round(raw[2], 1)
-      fx, fz = raw[6] / 32767.0, raw[8] / 32767.0
+      car["x"] = round(m.world_position_x, 1)
+      car["z"] = round(m.world_position_z, 1)
+      fx, fz = m.world_forward_dir_x / 32767.0, m.world_forward_dir_z / 32767.0
       car["heading"] = round((math.degrees(math.atan2(fx, fz)) + 360) % 360, 1)
 
-  def _parse_session(self, data):
-    if len(data) < HEADER_SIZE + 8:
+  def _parse_session(self, data, lay):
+    if len(data) < HEADER_SIZE + ctypes.sizeof(SessionPrefix):
       return
-    self.weather = data[HEADER_SIZE]
-    self.track_temp = data[HEADER_SIZE + 1]
-    self.air_temp = data[HEADER_SIZE + 2]
-    # F1 24: weather, trackTemp, airTemp, totalLaps, trackLength(u16), sessionType, trackId
-    self.track_id = struct.unpack_from("<b", data, HEADER_SIZE + 7)[0]
-
-  def _parse_lap_data(self, data):
-    for i in range(22):
-      offset = HEADER_SIZE + i * LAP_DATA_CAR_SIZE
-      if offset + LAP_DATA_CAR_SIZE > len(data):
+    s = SessionPrefix.from_buffer_copy(data, HEADER_SIZE)
+    self.weather = s.weather
+    self.track_temp = s.track_temperature
+    self.air_temp = s.air_temperature
+    self.total_laps = s.total_laps
+    self.session_type = s.session_type
+    self.track_id = s.track_id
+    self.safety_car = s.safety_car_status
+    self.pit_window = (s.pit_stop_window_ideal_lap, s.pit_stop_window_latest_lap)
+    self.track_length = s.track_length
+    key = (self.session_uid, s.track_id, s.session_type)
+    if key != self._session_announced:
+      self._session_announced = key
+      if self.on_session:
+        self.on_session({
+          "session_uid": self.session_uid, "track_id": s.track_id,
+          "track": TRACK_NAMES.get(s.track_id, f"Track-{s.track_id}"),
+          "track_length": s.track_length, "total_laps": s.total_laps,
+          "session": SESSION_TYPES.get(s.session_type, "Unknown"),
+        })
+    # Rain chance "now": first forecast sample for this session
+    rain = 0
+    for k in range(min(s.num_weather_forecast_samples, 64)):
+      w = s.weather_forecast_samples[k]
+      if w.session_type == s.session_type:
+        rain = w.rain_percentage
         break
+    self.rain_percent = rain
+
+  def _parse_lap_data(self, data, lay):
+    for i, ld in self._each_car(data, lay["lap"]):
       car = self.cars.setdefault(i, {})
-      last_ms, cur_ms = struct.unpack_from("<II", data, offset)
-      # deltas: uint16 ms part + uint8 minutes part
-      ahead_ms, ahead_min = struct.unpack_from("<HB", data, offset + 14)
-      lead_ms, lead_min = struct.unpack_from("<HB", data, offset + 17)
-      lap_dist = struct.unpack_from("<f", data, offset + 20)[0]
-      total_dist = struct.unpack_from("<f", data, offset + 24)[0]
-      position = data[offset + 32]
-      current_lap = data[offset + 33]
-      car["lapTime"] = round(cur_ms / 1000.0, 3) if cur_ms else 0
-      car["lapDist"] = round(lap_dist, 1)
-      if last_ms:
-        last_s = round(last_ms / 1000.0, 3)
-        prev_best = car.get("bestLapTime") or 0
-        if prev_best <= 0 or last_s < prev_best:
+      car["lapTime"] = round(ld.current_lap_time_in_ms / 1000.0, 3) if ld.current_lap_time_in_ms else 0
+      if ld.last_lap_time_in_ms:
+        last_s = round(ld.last_lap_time_in_ms / 1000.0, 3)
+        car["lastLapTime"] = last_s
+        best = car.get("bestLapTime") or 0
+        if best <= 0 or last_s < best:
           car["bestLapTime"] = last_s
-      car["position"] = position
-      car["cumulDist"] = round(total_dist, 1)
-      car["gapToAhead"] = round((ahead_min * 60000 + ahead_ms) / 1000.0, 3)
-      car["gapToLeader"] = round((lead_min * 60000 + lead_ms) / 1000.0, 3)
+      car["lapDist"] = round(ld.lap_distance, 1)
+      car["cumulDist"] = round(ld.total_distance, 1)
+      car["position"] = ld.car_position
+      car["currentLap"] = ld.current_lap_num
+      car["gapToAhead"] = _ms_min(ld.delta_to_car_in_front_ms_part, ld.delta_to_car_in_front_minutes_part)
+      car["gapToLeader"] = _ms_min(ld.delta_to_race_leader_ms_part, ld.delta_to_race_leader_minutes_part)
+      car["pitStatus"] = PIT_STATUS.get(ld.pit_status, "")
+      car["pitStops"] = ld.num_pit_stops
+      car["penalties"] = ld.penalties
+      car["resultStatus"] = ld.result_status
       if i == self.player_idx:
-        self.lap = current_lap
+        self.lap = ld.current_lap_num
+        self.player_lap = {
+          "lap": ld.current_lap_num, "dist": ld.lap_distance,
+          "lap_ms": ld.current_lap_time_in_ms, "last_lap_ms": ld.last_lap_time_in_ms,
+          "invalid": bool(ld.current_lap_invalid), "pit": ld.pit_status != 0,
+          "sector": ld.sector,
+        }
 
-    # gap to car behind = ahead gap of the car one place behind
-    by_pos = {}
-    for idx, c in self.cars.items():
-      pos = c.get("position") or 0
-      if pos:
-        by_pos[pos] = idx
-    for idx, c in self.cars.items():
-      pos = c.get("position") or 0
-      behind_idx = by_pos.get(pos + 1)
-      if behind_idx is not None:
-        c["gapToBehind"] = self.cars[behind_idx].get("gapToAhead", 0)
-      else:
-        c["gapToBehind"] = 0
-      # keep old key for UI compatibility
-      c["gapToNext"] = c.get("gapToBehind", 0)
+    by_pos = {c.get("position"): idx for idx, c in self.cars.items() if c.get("position")}
+    for c in self.cars.values():
+      behind = by_pos.get((c.get("position") or 0) + 1)
+      c["gapToBehind"] = self.cars[behind].get("gapToAhead", 0) if behind is not None else 0
 
-  def _parse_participants(self, data):
+  def _parse_participants(self, data, lay):
     if len(data) < HEADER_SIZE + 1:
       return
-    for i in range(22):
-      offset = HEADER_SIZE + 1 + i * 60
-      if offset + 60 > len(data):
-        break
-      race_number = data[offset + 5]
-      raw_name = data[offset + 7: offset + 7 + 48]
-      name = raw_name.decode("utf-8", errors="ignore").strip("\x00").strip()
+    self.num_active = data[HEADER_SIZE]
+    for i, p in self._each_car(data, lay["participant"], HEADER_SIZE + 1):
       car = self.cars.setdefault(i, {})
-      car["raceNumber"] = race_number
+      car["raceNumber"] = p.race_number
+      car["teamId"] = p.team_id
+      name = p.name.decode("utf-8", errors="ignore").strip()
       if name:
         car["name"] = name
 
-  def _parse_car_telemetry(self, data):
-    for i in range(22):
-      offset = HEADER_SIZE + i * CAR_TELE_SIZE
-      if offset + CAR_TELE_SIZE > len(data):
-        break
-      raw = CAR_TELE_FMT.unpack_from(data, offset)
+  def _parse_car_telemetry(self, data, lay):
+    for i, t in self._each_car(data, lay["telemetry"]):
       car = self.cars.setdefault(i, {})
-      surface_temps = raw[14:18]
-      inner_temps = raw[18:22]
       car.update({
-        "speed": raw[0],
-        "throttle": round(raw[1] * 100, 1),
-        "brake": round(raw[3] * 100, 1),
-        "gear": raw[5],
-        "rpm": raw[6],
-        "drs": bool(raw[7]),
-        "engineTemp": raw[22],
+        "speed": t.speed,
+        "throttle": round(t.throttle * 100, 1),
+        "brake": round(t.brake * 100, 1),
+        "gear": t.gear,
+        "rpm": t.engine_rpm,
+        "drs": bool(t.drs),
+        "engineTemp": t.engine_temperature,
         "tireTemps": {
-          _wheel_map[j]: max(surface_temps[j], inner_temps[j]) for j in range(4)
+          WHEELS[j]: max(t.tyres_surface_temperature[j], t.tyres_inner_temperature[j])
+          for j in range(4)
         },
+        "tirePressures": _wheels(t.tyres_pressure, lambda v: round(v, 1)),
       })
+      if i == self.player_idx and self.on_player_sample and self.player_lap:
+        self._emit_player_sample(t, car)
 
-  def _parse_car_status(self, data):
-    for i in range(22):
-      offset = HEADER_SIZE + i * CAR_STATUS_CAR_SIZE
-      if offset + CAR_STATUS_CAR_SIZE > len(data):
-        continue
-      car = self.cars.setdefault(i, {})
-      fuel = struct.unpack_from("<f", data, offset + CAR_STATUS_FUEL_OFFSET)[0]
-      car["fuel"] = round(fuel, 2)
-      compound_id = data[offset + CAR_STATUS_COMPOUND_OFFSET]
-      car["compound"] = COMPOUND_NAMES.get(compound_id, f"T{compound_id}")
-      car["stintLaps"] = data[offset + 27]  # m_tyresAgeLaps
-      ers_j = struct.unpack_from("<f", data, offset + CAR_STATUS_ERS_OFFSET)[0]
-      car["ersBattery"] = round(max(0.0, min(100.0, (ers_j / ERS_MAX_J) * 100.0)), 1)
+  def _emit_player_sample(self, t, car):
+    pl, ex = self.player_lap, self.player_ex
+    sample = {
+      "t": self.session_time,
+      "lap": pl["lap"], "dist": pl["dist"], "lap_ms": pl["lap_ms"],
+      "last_lap_ms": pl["last_lap_ms"], "invalid": pl["invalid"], "pit": pl["pit"],
+      "speed": t.speed, "throttle": t.throttle, "brake": t.brake, "steer": t.steer,
+      "gear": t.gear,
+      "surface": [t.surface_type[j] for j in range(4)],
+      "tyre_surface": [t.tyres_surface_temperature[j] for j in range(4)],
+      "x": car.get("x"), "z": car.get("z"),
+      "wear": car.get("tireWear"),            # {"RL": %, ...} from the damage packet
+      "compound": car.get("compound"),
+      # RL, RR, FL, FR — None when MotionEx isn't arriving
+      "slip_ratio": list(ex["slip_ratio"]) if ex else None,
+      "slip_angle": list(ex["slip_angle"]) if ex else None,
+    }
+    try:
+      self.on_player_sample(sample)
+    except Exception as e:  # never let coaching break telemetry
+      print(f"[coach] sample error: {e}")
 
-  def _parse_car_damage(self, data):
-    for i in range(22):
-      offset = HEADER_SIZE + i * CAR_DMG_CAR_SIZE
-      if offset + CAR_DMG_CAR_SIZE > len(data):
-        # F1 24 size is 42; accept slightly shorter if trailing fields missing
-        if offset + 26 > len(data):
-          continue
+  def _parse_motion_ex(self, data, lay):
+    if len(data) < HEADER_SIZE + ctypes.sizeof(MotionExPrefix):
+      return
+    m = MotionExPrefix.from_buffer_copy(data, HEADER_SIZE)
+    self.player_ex = {
+      "slip_ratio": [m.wheel_slip_ratio[j] for j in range(4)],
+      "slip_angle": [m.wheel_slip_angle[j] for j in range(4)],
+    }
+
+  def _parse_car_status(self, data, lay):
+    for i, s in self._each_car(data, lay["status"]):
       car = self.cars.setdefault(i, {})
-      if offset + 16 <= len(data):
-        wears = struct.unpack_from("<4f", data, offset + CAR_DMG_WEAR_OFFSET)
-        car["tireWear"] = {
-          _wheel_map[j]: round(wears[j], 1) for j in range(4)
-        }
-      if offset + CAR_DMG_FRONT_WING_OFFSET + 2 <= len(data):
-        fl = data[offset + CAR_DMG_FRONT_WING_OFFSET]
-        fr = data[offset + CAR_DMG_FRONT_WING_OFFSET + 1]
-        car["damage"] = max(fl, fr)
+      car["fuel"] = round(s.fuel_in_tank, 2)
+      car["fuelLapsLeft"] = round(s.fuel_remaining_laps, 2)  # game's own +/- laps estimate
+      car["compound"] = COMPOUND_NAMES.get(s.actual_tyre_compound, f"T{s.actual_tyre_compound}")
+      car["visualCompound"] = VISUAL_COMPOUND_NAMES.get(s.visual_tyre_compound, "")
+      car["stintLaps"] = s.tyres_age_laps
+      car["ersBattery"] = round(max(0.0, min(100.0, s.ers_store_energy / ERS_MAX_J * 100.0)), 1)
+      car["ersMode"] = ERS_MODES.get(s.ers_deploy_mode, "NONE")
+      car["drsAllowed"] = bool(s.drs_allowed)
+
+  def _parse_car_damage(self, data, lay):
+    for i, d in self._each_car(data, lay["damage"]):
+      car = self.cars.setdefault(i, {})
+      car["tireWear"] = _wheels(d.tyres_wear, lambda v: round(v, 1))
+      car["tireDamage"] = _wheels(d.tyres_damage)
+      if hasattr(d, "tyre_blisters"):
+        car["tireBlisters"] = _wheels(d.tyre_blisters)
+      car["damage"] = max(d.front_left_wing_damage, d.front_right_wing_damage)
+      car["rearWingDamage"] = d.rear_wing_damage
+      car["floorDamage"] = d.floor_damage
+
+  # -- output ----------------------------------------------------------------
+
+  def _is_active(self, idx, c):
+    if self.num_active is not None and idx >= self.num_active and idx != self.player_idx:
+      return False
+    # result status 0 = invalid, 1 = inactive; position 0 = empty slot
+    if c.get("resultStatus") in (0, 1) and idx != self.player_idx:
+      return False
+    return bool(c.get("position")) or idx == self.player_idx
 
   def _build_frame(self):
+    zero4 = {w: 0 for w in ("FL", "FR", "RL", "RR")}
     all_cars = []
-    for idx in sorted(self.cars.keys()):
+    for idx in sorted(self.cars):
       c = self.cars[idx]
+      if "position" in c and not self._is_active(idx, c):
+        continue
       all_cars.append({
         "idx": idx,
         "raceNumber": c.get("raceNumber", idx),
         "name": c.get("name", f"#{idx}"),
-        "x": c.get("x", 0),
-        "z": c.get("z", 0),
-        "heading": c.get("heading", 0),
-        "speed": c.get("speed", 0),
-        "rpm": c.get("rpm", 0),
-        "gear": c.get("gear", 0),
-        "throttle": c.get("throttle", 0),
-        "brake": c.get("brake", 0),
-        "fuel": c.get("fuel", 0),
+        "x": c.get("x", 0), "z": c.get("z", 0), "heading": c.get("heading", 0),
+        "speed": c.get("speed", 0), "rpm": c.get("rpm", 0), "gear": c.get("gear", 0),
+        "throttle": c.get("throttle", 0), "brake": c.get("brake", 0),
+        "fuel": c.get("fuel", 0), "fuelLapsLeft": c.get("fuelLapsLeft"),
         "engineTemp": c.get("engineTemp", 0),
-        "tireTemps": c.get("tireTemps", {"FL": 0, "FR": 0, "RL": 0, "RR": 0}),
-        "tireWear": c.get("tireWear", {"FL": 0, "FR": 0, "RL": 0, "RR": 0}),
+        "tireTemps": c.get("tireTemps", dict(zero4)),
+        "tireWear": c.get("tireWear", dict(zero4)),
+        "tireBlisters": c.get("tireBlisters", dict(zero4)),
         "damage": c.get("damage", 0),
         "compound": c.get("compound", "C3"),
+        "visualCompound": c.get("visualCompound", ""),
         "drs": c.get("drs", False),
         "ersBattery": c.get("ersBattery", 0),
+        "ersMode": c.get("ersMode", "NONE"),
         "lapTime": c.get("lapTime", 0),
+        "lastLapTime": c.get("lastLapTime", 0),
         "bestLapTime": c.get("bestLapTime", 0),
         "stintLaps": c.get("stintLaps", 0),
         "tyreAge": c.get("stintLaps", 0),
         "position": c.get("position", 0),
         "gapToLeader": c.get("gapToLeader", 0),
         "gapToAhead": c.get("gapToAhead", 0),
-        "gapToBehind": c.get("gapToBehind", c.get("gapToNext", 0)),
-        "gapToNext": c.get("gapToNext", c.get("gapToBehind", 0)),
+        "gapToBehind": c.get("gapToBehind", 0),
+        "gapToNext": c.get("gapToBehind", 0),
+        "pitStatus": c.get("pitStatus", ""),
+        "pitStops": c.get("pitStops", 0),
+        "penalties": c.get("penalties", 0),
         "cumulDist": c.get("cumulDist", 0),
         "lapDist": c.get("lapDist", -1),
         "trend": c.get("trend", "→"),
       })
 
-    track_name = TRACK_NAMES.get(self.track_id, f"Track-{self.track_id}")
-    weather_map = {
-      0: "Clear", 1: "LightCloud", 2: "Overcast",
-      3: "LightRain", 4: "HeavyRain", 5: "Storm",
-    }
-
     return {
       "cars": all_cars,
       "track": {
         "id": self.track_id,
-        "name": track_name,
-        "weather": weather_map.get(self.weather, "Clear"),
+        "name": TRACK_NAMES.get(self.track_id, f"Track-{self.track_id}"),
+        "weather": WEATHER_NAMES.get(self.weather, "Clear"),
+        "rainPercent": self.rain_percent,
         "trackTemp": self.track_temp,
         "airTemp": self.air_temp,
+        "totalLaps": self.total_laps,
+        "session": SESSION_TYPES.get(self.session_type, "Unknown"),
+        "safetyCar": {0: "", 1: "SC", 2: "VSC", 3: "FORMATION"}.get(self.safety_car, ""),
+        "pitWindow": list(self.pit_window),
       },
       "player_idx": self.player_idx,
       "lap": self.lap,
+      "game": {2024: "F1 24", 2025: "F1 25", 2026: "F1 25 (2026 pack)"}.get(self.packet_format, "F1"),
     }
