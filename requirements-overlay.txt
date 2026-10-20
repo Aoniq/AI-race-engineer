@@ -1,0 +1,5 @@
+# In-game radio overlay (overlay.py) — only needed on the PC that runs the game
+PyQt6>=6.6
+PyQt6-WebEngine>=6.6
+# Optional: push-to-talk on a wheel / button-box / controller button
+pygame>=2.5

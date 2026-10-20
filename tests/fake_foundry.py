@@ -58,7 +58,24 @@ async def chat(deployment: str, request: Request):
 async def speech(deployment: str, request: Request):
   body = await request.json()
   _record(request, deployment, body)
-  return Response(content=b"ID3\x03\x00fake-mp3", media_type="audio/mpeg")
+  return Response(content=_speech_wav(body.get("input", "")), media_type="audio/mpeg")
+
+
+def _speech_wav(text: str) -> bytes:
+  """A playable clip roughly as long as the sentence, with a speech-like loudness rhythm."""
+  import io, math, struct, wave
+  rate, secs = 16000, max(0.8, min(6.0, 0.06 * len(text)))
+  buf = io.BytesIO()
+  with wave.open(buf, "wb") as w:
+    w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+    frames = bytearray()
+    for i in range(int(rate * secs)):
+      t = i / rate
+      env = max(0.0, math.sin(2 * math.pi * 3.1 * t)) * (0.6 + 0.4 * math.sin(2 * math.pi * 0.7 * t))
+      v = env * (math.sin(2 * math.pi * 180 * t) + 0.5 * math.sin(2 * math.pi * 360 * t))
+      frames += struct.pack("<h", int(max(-1, min(1, v * 0.6)) * 32000))
+    w.writeframes(bytes(frames))
+  return buf.getvalue()
 
 
 @app.post("/openai/deployments/{deployment}/audio/transcriptions")

@@ -18,6 +18,7 @@ One Foundry resource, one endpoint and one key cover all three.
 - **Coaches your driving** from your own car's telemetry: finds the corners where you lose time (braking too deep, braking too early, over-slowing, late on the throttle), lock-ups, wheelspin, under- and oversteer, off-tracks and coasting — and which of those habits wear the tyre that limits your stint.
 - Lets the driver talk back on pit radio: the browser records, Foundry transcribes, the engineer answers in text and voice.
 - Shows a live dashboard: standings, track map, selected-car data, and the radio log.
+- Puts **team radio on top of the game**, broadcast-style: a caption with your team colour, the live voice waveform and the words as they're spoken — with a key or wheel button to talk back while you drive. Also works as an OBS source.
 - Falls back to a 22-car simulator when a game is not connected.
 
 ## 1. Set up Microsoft Foundry
@@ -98,6 +99,30 @@ The coaching appears in the **Driving Coach** panel and on the map (corners colo
 
 The thresholds (slip ratios, slip angles, metres, km/h) are in `CoachConfig` in `coach.py`. They're validated on synthetic laps; tune them after a few real sessions if the coach is too chatty or too quiet.
 
+## In-game radio overlay
+
+Team radio as a broadcast-style caption on top of F1 25: who's talking, your team colour, a waveform that moves with the voice, and the words appearing as they're spoken. It shows the engineer's strategy calls, coaching tips and replies, and your own messages.
+
+### On the PC that runs F1 25
+
+1. In F1 25, set **Display Mode** to **Borderless** (or windowed). An exclusive-fullscreen game draws over every other window.
+2. Start the server as usual (`start.bat`), then run **`start-overlay.bat`**. The first run installs the overlay components (about 150 MB). The overlay lives in the system tray: right-click it for *Send a test message*, *Hide overlay* or *Quit*.
+3. **Talk while driving:** hold **F9** (or tap to start, tap again to send). Change the key with `OVERLAY_PTT_KEY` — pick one the game doesn't use.
+4. **Wheel button instead:** run `start-overlay.bat --list-buttons`, press the button you want, and put the number it shows in `OVERLAY_PTT_BUTTON` (and part of the wheel's name in `OVERLAY_PTT_DEVICE` if you have several controllers).
+
+The overlay is a separate, click-through window: it never takes focus and doesn't touch the game process. While it's running it plays the engineer's voice and the dashboard stays quiet, so you never hear things twice.
+
+Position and size: `OVERLAY_POSITION` (`bottom-left`, `middle-left`, `top-right`, …), nudge with `OVERLAY_X` / `OVERLAY_Y` (% of the screen), `OVERLAY_SCALE`, and `OVERLAY_SCREEN` for another monitor. `python overlay.py --demo` loops sample messages so you can line it up with the game's HUD. F1 25 often sends your name as "Player": set `OVERLAY_DRIVER_NAME` to show yours.
+
+### Streaming, PlayStation or Xbox
+
+The overlay is also a web page: **http://127.0.0.1:8000/overlay**.
+
+- **OBS:** add a *Browser* source with that URL, 1920×1080. It's transparent, so put it above your game capture. Add `?audio=0` if the dashboard or the overlay app already plays the voice on your PC.
+- **Console:** on PlayStation or Xbox nothing can be drawn over the console's own picture. Use a capture card into OBS (above), or put the overlay on a phone or tablet next to your screen: set `HOST=0.0.0.0` in `.env` and open `http://<this-PC's-IP>:8000/overlay` on it.
+
+URL options: `pos`, `x`, `y`, `scale`, `audio`, `name`, `accent` (team colour, e.g. `ff8000`), `linger` (seconds a message stays), `demo=1`.
+
 ## Pit radio
 
 Click **MIC** or press Space to start talking, press again to send. Ask about tires, the pit window, gaps or fuel. The first time, the browser asks for microphone access. Set `RADIO_LANGUAGE=nl` (or another ISO code) to talk to — and hear back from — your engineer in another language.
@@ -124,6 +149,12 @@ Click **MIC** or press Space to start talking, press again to send. Ask about ti
 | `COACH_RACE_EVERY_LAPS` | In races, laps between spoken tyre tips. Defaults to `3` |
 | `COACH_MIN_LOSS_S` | Smallest time loss worth a spoken driving tip. Defaults to `0.08` |
 | `UI_MAX_FPS` | Dashboard telemetry updates per second. Defaults to `15` |
+| `OVERLAY_POSITION`, `OVERLAY_X`, `OVERLAY_Y`, `OVERLAY_SCALE`, `OVERLAY_SCREEN` | Where the radio overlay sits and how big it is |
+| `OVERLAY_PTT_KEY` | Push-to-talk key in the overlay (hold or tap). Defaults to `F9`; `off` to disable |
+| `OVERLAY_PTT_BUTTON`, `OVERLAY_PTT_DEVICE` | Push-to-talk on a wheel/controller button (find it with `--list-buttons`) |
+| `OVERLAY_DRIVER_NAME`, `OVERLAY_ACCENT` | Your name and team colour on the radio |
+| `OVERLAY_AUDIO` | `1` = the overlay plays the engineer's voice. Defaults to `1` |
+| `HOST`, `PORT` | Where the dashboard and overlay are served. `HOST=0.0.0.0` makes them reachable from other devices |
 
 ## Layout
 
@@ -138,8 +169,10 @@ Click **MIC** or press Space to start talking, press again to send. Ask about ti
 | `tts_bridge.py` | Engineer voice files |
 | `simulator.py` | WebSocket telemetry source for local runs |
 | `static/index.html` | Live dashboard |
+| `static/overlay.html` | Team-radio overlay page (desktop overlay, OBS, phone) |
+| `overlay.py` | Desktop overlay for PC: transparent click-through window, push-to-talk key or wheel button |
 | `tools/udp_demo.py` | Sends synthetic F1 25 laps over UDP to try the coach without the game |
-| `tests/` | Parser, coach and Foundry-wiring tests (`pip install -r requirements-dev.txt`, then `python -m pytest`) |
+| `tests/` | Parser, coach, overlay and Foundry-wiring tests (`pip install -r requirements-dev.txt`, then `python -m pytest`) |
 
 ## Changes from upstream besides Foundry
 

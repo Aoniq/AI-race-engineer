@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Team radio overlay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Saira+Semi+Condensed:wght@500;600;700;800&display=swap" rel="stylesheet">
+<!--
+  Team-radio overlay. Transparent page, meant for:
+    - the desktop overlay app (overlay.py), drawn on top of the game
+    - an OBS "Browser" source (1920x1080) for streams / console capture
+    - a phone or tablet next to the screen
+
+  URL options (all optional):
+    pos     bottom-left (default) | middle-left | top-left | top-center | bottom-center
+            | top-right | middle-right | bottom-right
+    x, y    extra offset from that corner in % of the screen (e.g. x=3&y=20)
+    scale   size multiplier (default 1 at 1080p, grows with the window height)
+    audio   1 = this overlay plays the radio voice (default), 0 = text only
+    name    your name on the radio (instead of the in-game name)
+    accent  team colour override, e.g. accent=ff8000
+    linger  seconds a message stays after the voice ends (default 2.5)
+    demo    1 = loop sample messages, for positioning
+-->
+<style>
+  :root {
+    --ink: rgba(10, 16, 28, 0.86);
+    --ink-solid: #0A101C;
+    --paper: #F4F6FA;
+    --mist: #93A0B4;
+    --tx: #FF3347;
+    --accent: #F2B33D;
+    --u: calc(var(--scale, 1) * min(1px, 0.0925vh) * 1.08);  /* 1 design px at 1080p */
+    --off-x: 3vw;
+    --off-y: 21vh;
+  }
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; }
+  body {
+    font-family: "Saira Semi Condensed", Bahnschrift, "DIN Alternate", "Segoe UI", system-ui, sans-serif;
+    color: var(--paper);
+    -webkit-font-smoothing: antialiased;
+    pointer-events: none;
+  }
+
+  /* ---- placement ---------------------------------------------------------- */
+  #stage { position: fixed; display: flex; flex-direction: column; gap: calc(10 * var(--u)); }
+  body[data-pos$="left"]   #stage { left: var(--off-x); align-items: flex-start; }
+  body[data-pos$="right"]  #stage { right: var(--off-x); align-items: flex-end; }
+  body[data-pos$="center"] #stage { left: 50%; transform: translateX(-50%); align-items: center; }
+  body[data-pos^="top"]    #stage { top: var(--off-y); }
+  body[data-pos^="bottom"] #stage { bottom: var(--off-y); }
+  body[data-pos^="middle"] #stage { top: 50%; transform: translateY(-50%); }
+
+  /* ---- the radio card ----------------------------------------------------- */
+  .card {
+    position: relative;
+    display: grid;
+    grid-template-columns: calc(12 * var(--u)) auto;
+    min-width: calc(380 * var(--u));
+    max-width: calc(680 * var(--u));
+    filter: drop-shadow(0 calc(6 * var(--u)) calc(14 * var(--u)) rgba(0, 0, 0, 0.45));
+    clip-path: inset(0 100% 0 0);
+    transition: clip-path 260ms cubic-bezier(.2, .8, .2, 1);
+  }
+  .card.show { clip-path: inset(0 0 0 0); }
+  .card.leave { clip-path: inset(0 0 0 100%); transition-duration: 220ms; }
+
+  .rail {
+    background: var(--accent);
+    clip-path: polygon(0 calc(16 * var(--u)), 100% 0, 100% 100%, 0 100%);
+  }
+  .body { background: var(--ink); padding: calc(10 * var(--u)) calc(18 * var(--u)) calc(14 * var(--u)) calc(14 * var(--u)); }
+
+  .head {
+    display: flex; align-items: center; gap: calc(10 * var(--u));
+    height: calc(30 * var(--u));
+  }
+  .num {
+    min-width: calc(32 * var(--u)); height: calc(26 * var(--u));
+    padding: 0 calc(5 * var(--u)); box-sizing: border-box;
+    display: grid; place-items: center;
+    background: var(--paper); color: var(--ink-solid);
+    font-weight: 800; font-size: calc(18 * var(--u)); line-height: 1;
+    font-variant-numeric: tabular-nums;
+  }
+  .who {
+    font-weight: 700; font-size: calc(23 * var(--u)); letter-spacing: 0.04em;
+    text-transform: uppercase; white-space: nowrap; line-height: 1;
+  }
+  .card[data-speaker="engineer"] .who { color: var(--mist); }
+  .tx {
+    width: calc(9 * var(--u)); height: calc(9 * var(--u)); border-radius: 50%;
+    background: var(--tx); display: none;
+  }
+  .card[data-state="tx"] .tx { display: block; animation: blink 1s steps(2, start) infinite; }
+  .wave { margin-left: auto; width: calc(92 * var(--u)); height: calc(26 * var(--u)); display: block; }
+
+  .text {
+    margin-top: calc(6 * var(--u));
+    font-weight: 500; font-size: calc(28 * var(--u)); line-height: 1.22;
+    max-width: 30em;
+    text-wrap: pretty;
+  }
+  .text .w { opacity: 0.14; transition: opacity 140ms linear; }
+  .text .w.on { opacity: 1; }
+  .card[data-speaker="driver"] .text { color: #E3E8F0; }
+  .text .pending { color: var(--mist); letter-spacing: 0.2em; }
+
+  /* ---- small notices ------------------------------------------------------ */
+  #notice {
+    pointer-events: auto; cursor: pointer;
+    font-weight: 600; font-size: calc(15 * var(--u));
+    background: var(--ink); padding: calc(6 * var(--u)) calc(12 * var(--u));
+    border-left: calc(4 * var(--u)) solid var(--tx);
+    display: none;
+  }
+  #notice.on { display: block; }
+
+  @keyframes blink { to { visibility: hidden; } }
+  @media (prefers-reduced-motion: reduce) {
+    .card, .card.leave { transition: none; }
+    .text .w { transition: none; }
+  }
+</style>
+</head>
+<body data-pos="bottom-left">
+<div id="stage">
+  <div id="notice" role="button">Click once to let the radio play sound</div>
+</div>
+
+<template id="card-tpl">
+  <div class="card" data-speaker="engineer">
+    <div class="rail"></div>
+    <div class="body">
+      <div class="head">
+        <span class="num"></span>
+        <span class="tx" aria-hidden="true"></span>
+        <span class="who"></span>
+        <canvas class="wave" width="184" height="52" aria-hidden="true"></canvas>
+      </div>
+      <div class="text"></div>
+    </div>
+  </div>
+</template>
+
+<audio id="voice" preload="auto"></audio>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- settings
+const qs = new URLSearchParams(location.search);
+const cfg = {
+  pos: qs.get("pos") || "bottom-left",
+  audio: qs.get("audio") !== "0",
+  name: (qs.get("name") || "").trim(),
+  linger: parseFloat(qs.get("linger") || "2.5"),
+  demo: qs.get("demo") === "1",
+  engineer: (qs.get("engineer") || "Race engineer").trim(),
+};
+document.body.dataset.pos = cfg.pos;
+const root = document.documentElement.style;
+if (qs.get("scale")) root.setProperty("--scale", qs.get("scale"));
+if (qs.get("x")) root.setProperty("--off-x", `${parseFloat(qs.get("x"))}vw`);
+if (qs.get("y")) root.setProperty("--off-y", `${parseFloat(qs.get("y"))}vh`);
+
+// F1 25 team ids -> team colour (accent rail). Unknown ids keep the default amber.
+const TEAM_COLOURS = {
+  0: "#27F4D2", 1: "#E8002D", 2: "#3671C6", 3: "#64C4FF", 4: "#229971",
+  5: "#0093CC", 6: "#6692FF", 7: "#B6BABD", 8: "#FF8000", 9: "#52E252",
+};
+const player = { name: "", number: "", teamId: null };
+function applyAccent() {
+  const override = qs.get("accent");
+  const c = override ? `#${override.replace(/^#/, "")}` : TEAM_COLOURS[player.teamId];
+  if (c) root.setProperty("--accent", c);
+}
+applyAccent();
+
+function driverName() {
+  if (cfg.name) return cfg.name;
+  const n = (player.name || "").trim();
+  if (!n || /^player$/i.test(n) || /^#\d+$/.test(n)) return "Driver";
+  return n.split(/\s+/).pop();  // surname, like the broadcast graphic
+}
+
+// ---------------------------------------------------------------- audio
+const voice = document.getElementById("voice");
+let actx = null, analyser = null, micAnalyser = null;
+const freq = new Uint8Array(64);
+
+function ensureAudioGraph() {
+  if (actx) return actx;
+  try {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = actx.createAnalyser();
+    analyser.fftSize = 128;
+    analyser.smoothingTimeConstant = 0.6;
+    const src = actx.createMediaElementSource(voice);
+    src.connect(analyser);
+    analyser.connect(actx.destination);
+  } catch (e) {
+    console.warn("No WebAudio, waveform will be simulated", e);
+    actx = null;
+  }
+  return actx;
+}
+
+const notice = document.getElementById("notice");
+notice.addEventListener("click", () => {
+  ensureAudioGraph();
+  if (actx && actx.state === "suspended") actx.resume();
+  notice.classList.remove("on");
+});
+
+async function playVoice(url) {
+  // Resolves with the clip duration (s) once playback starts, or null if it can't play.
+  if (!cfg.audio || !url) return null;
+  ensureAudioGraph();
+  if (actx && actx.state === "suspended") { try { await actx.resume(); } catch (_) {} }
+  voice.src = url;
+  try {
+    await voice.play();
+  } catch (e) {
+    // Only an autoplay block needs a click; a broken clip just shows as text
+    if (e && e.name === "NotAllowedError") notice.classList.add("on");
+    else console.warn("Radio clip didn't play:", e && e.message);
+    return null;
+  }
+  if (!isFinite(voice.duration) || !voice.duration) {
+    await new Promise(r => voice.addEventListener("loadedmetadata", r, { once: true }));
+  }
+  return voice.duration || null;
+}
+
+// ---------------------------------------------------------------- cards
+const stage = document.getElementById("stage");
+const tpl = document.getElementById("card-tpl");
+let card = null;            // the visible card element
+let level = 0;              // smoothed loudness 0..1 for the waveform
+
+function makeCard() {
+  const el = tpl.content.firstElementChild.cloneNode(true);
+  stage.insertBefore(el, notice);
+  requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add("show")));
+  return el;
+}
+
+function setCard(speaker, state) {
+  if (!card || card.classList.contains("leave")) card = makeCard();
+  card.dataset.speaker = speaker;
+  card.dataset.state = state || "";
+  card.querySelector(".num").textContent = player.number || "";
+  card.querySelector(".num").style.display = player.number ? "" : "none";
+  card.querySelector(".who").textContent = speaker === "engineer" ? cfg.engineer : driverName();
+  return card;
+}
+
+function setText(el, text, revealAll) {
+  const box = el.querySelector(".text");
+  box.innerHTML = "";
+  const words = String(text || "").trim().split(/\s+/).filter(Boolean);
+  for (const w of words) {
+    const s = document.createElement("span");
+    s.className = "w" + (revealAll ? " on" : "");
+    s.textContent = w + " ";
+    box.appendChild(s);
+  }
+  return [...box.querySelectorAll(".w")];
+}
+
+function setPending(el) {
+  el.querySelector(".text").innerHTML = '<span class="pending">…</span>';
+}
+
+function hideCard() {
+  if (!card) return;
+  const old = card;
+  card = null;
+  old.classList.remove("show");
+  old.classList.add("leave");
+  setTimeout(() => old.remove(), 300);
+}
+
+// ---------------------------------------------------------------- queue
+const queue = [];
+const seenAudio = new Set();
+let busy = false;
+let hideTimer = null;
+let lastDriverText = "";
+let txActive = false;       // mic keyed, or waiting for the engineer's answer
+let awaitingReply = false;
+let gen = 0;                // bumps when the driver keys the mic: abandons the current message
+let mimeSpeech = false;     // a text-only message is "speaking": animate a synthetic wave
+
+function enqueue(item, front) {
+  if (item.audio_url) {
+    if (seenAudio.has(item.audio_url)) return;
+    seenAudio.add(item.audio_url);
+  }
+  if (!item.text) return;
+  front ? queue.unshift(item) : queue.push(item);
+  if (!busy && !txActive) next();
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function voiceDone() {
+  if (voice.ended || voice.paused) return Promise.resolve();
+  return new Promise(r => {
+    const done = () => { ["ended", "pause", "error"].forEach(ev => voice.removeEventListener(ev, done)); r(); };
+    ["ended", "pause", "error"].forEach(ev => voice.addEventListener(ev, done));
+  });
+}
+
+async function next() {
+  clearTimeout(hideTimer);
+  if (txActive || busy) return;
+  const item = queue.shift();
+  if (!item) {
+    hideTimer = setTimeout(hideCard, 200);
+    return;
+  }
+  const my = ++gen;
+  busy = true;
+  const el = setCard(item.speaker, "");
+  const words = setText(el, item.text, false);
+  const duration = item.speaker === "engineer" ? await playVoice(item.audio_url) : null;
+  if (my !== gen) return;
+  mimeSpeech = !duration && item.speaker === "engineer";
+  // reveal words across the spoken clip, or at a reading pace without audio
+  const total = duration ? duration * 1000 * 0.92 : Math.max(1200, words.length * 260);
+  const t0 = performance.now();
+  await new Promise(resolve => {
+    function step() {
+      if (my !== gen) return resolve();
+      const k = Math.min(1, (performance.now() - t0) / total);
+      const shown = Math.ceil(k * words.length);
+      for (let i = 0; i < shown; i++) words[i].classList.add("on");
+      if (k < 1) requestAnimationFrame(step); else resolve();
+    }
+    step();
+  });
+  mimeSpeech = false;
+  if (duration && my === gen) await voiceDone();
+  const linger = item.speaker === "driver" ? 900 : cfg.linger * 1000;
+  // a waiting message cuts the linger short
+  const until = performance.now() + linger;
+  while (my === gen && performance.now() < until && !queue.length) await sleep(100);
+  if (my !== gen) return;   // the driver keyed the mic meanwhile
+  busy = false;
+  next();
+}
+
+// ---------------------------------------------------------------- waveform
+function drawWave() {
+  let target = 0;
+  if (card && card.dataset.state === "tx" && micAnalyser) {
+    micAnalyser.getByteFrequencyData(freq);
+    target = bandLevel(freq);
+  } else if (analyser && !voice.paused) {
+    analyser.getByteFrequencyData(freq);
+    target = bandLevel(freq);
+  } else if (mimeSpeech && card) {
+    // no audio graph (text-only overlay): gentle synthetic speech rhythm
+    const t = performance.now() / 1000;
+    target = 0.35 + 0.25 * Math.sin(t * 9) * Math.sin(t * 3.3);
+  }
+  level += (target - level) * 0.35;
+  if (card) {
+    const cv = card.querySelector(".wave");
+    const g = cv.getContext("2d");
+    const W = cv.width, H = cv.height, bars = 13, gap = 4;
+    const bw = (W - gap * (bars - 1)) / bars;
+    g.clearRect(0, 0, W, H);
+    const live = card.dataset.state === "tx";
+    g.fillStyle = live ? getComputedStyle(document.documentElement).getPropertyValue("--tx")
+                       : getComputedStyle(document.documentElement).getPropertyValue("--accent");
+    const t = performance.now() / 140;
+    for (let i = 0; i < bars; i++) {
+      const centre = 1 - Math.abs(i - (bars - 1) / 2) / ((bars - 1) / 2);   // taller in the middle
+      const jitter = 0.55 + 0.45 * Math.abs(Math.sin(t + i * 1.7));
+      const h = Math.max(3, H * Math.min(1, level * (0.35 + 0.65 * centre) * jitter * 1.6));
+      g.fillRect(i * (bw + gap), (H - h) / 2, bw, h);
+    }
+  }
+  requestAnimationFrame(drawWave);
+}
+function bandLevel(arr) {
+  // speech energy lives in the low/mid bins
+  let sum = 0;
+  for (let i = 2; i < 24; i++) sum += arr[i];
+  return Math.min(1, Math.sqrt(sum / (22 * 255)) * 1.4);
+}
+requestAnimationFrame(drawWave);
+
+// ---------------------------------------------------------------- push-to-talk (driven by overlay.py)
+let recorder = null, micStream = null, chunks = [], downAt = 0;
+const MIME = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/mp4"]
+  .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
+
+async function startTx() {
+  if (recorder) return;
+  try {
+    micStream = micStream || await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+  } catch (e) {
+    showError("Microphone blocked — allow it for the overlay");
+    return;
+  }
+  ensureAudioGraph();
+  if (actx && !micAnalyser) {
+    try {
+      micAnalyser = actx.createAnalyser();
+      micAnalyser.fftSize = 128;
+      actx.createMediaStreamSource(micStream).connect(micAnalyser);  // not to the speakers
+    } catch (_) { micAnalyser = null; }
+  }
+  gen++;                              // abandon the message on screen
+  mimeSpeech = false;
+  if (!voice.paused) voice.pause();   // and stop the engineer talking
+  txActive = true;
+  busy = false;
+  chunks = [];
+  recorder = MIME ? new MediaRecorder(micStream, { mimeType: MIME }) : new MediaRecorder(micStream);
+  recorder.ondataavailable = ev => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+  recorder.onstop = sendTx;
+  recorder.start();
+  const el = setCard("driver", "tx");
+  setPending(el);
+}
+
+function stopTx() {
+  if (recorder && recorder.state !== "inactive") recorder.stop();
+}
+
+async function sendTx() {
+  const type = (recorder && recorder.mimeType) || MIME || "audio/webm";
+  const blob = new Blob(chunks, { type });
+  recorder = null;
+  chunks = [];
+  if (card) card.dataset.state = "";
+  if (blob.size < 1200) {           // a click, not a message
+    txActive = false;
+    hideCard();
+    next();
+    return;
+  }
+  awaitingReply = true;
+  const ext = type.includes("mp4") ? "m4a" : type.includes("ogg") ? "ogg" : "webm";
+  const form = new FormData();
+  form.append("audio", blob, `radio.${ext}`);
+  try {
+    const res = await fetch("/api/radio/audio", { method: "POST", body: form });
+    const d = await res.json();
+    awaitingReply = false;
+    txActive = false;
+    if (!d.ok) {
+      showError(d.error === "no speech heard" ? "Didn't catch that — say again" : "Radio failed — try again");
+      return;
+    }
+    if (d.driver && d.driver !== lastDriverText) showDriver(d.driver);
+    enqueue({ speaker: "engineer", text: d.voice || d.reply, audio_url: d.audio_url });
+    next();   // the reply may already be queued from the broadcast
+  } catch (e) {
+    awaitingReply = false;
+    showError("Can't reach Box-Box — is the server running?");
+  }
+}
+
+function showDriver(text) {
+  lastDriverText = text;
+  const el = setCard("driver", "");
+  setText(el, text, true);
+}
+
+function showError(msg) {
+  txActive = false;
+  busy = false;
+  gen++;
+  const el = setCard("engineer", "");
+  setText(el, msg, true);
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(() => { if (!busy) hideCard(); }, 2500);
+}
+
+// Hold the key/button to talk; a quick tap toggles (tap again to send).
+window.boxbox = {
+  pttDown() {
+    if (recorder) { stopTx(); return; }        // second tap in toggle mode
+    downAt = performance.now();
+    startTx();
+  },
+  pttUp() {
+    if (recorder && performance.now() - downAt > 350) stopTx();
+  },
+  pttToggle() { recorder ? stopTx() : startTx(); },
+  test() { fetch("/api/overlay/test", { method: "POST" }); },
+};
+
+// ---------------------------------------------------------------- server events
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/pitradio?role=overlay&audio=${cfg.audio ? 1 : 0}`);
+  ws.onmessage = e => {
+    const d = JSON.parse(e.data);
+    switch (d.type) {
+      case "player":
+        player.name = d.name || "";
+        player.number = d.raceNumber != null ? String(d.raceNumber) : "";
+        player.teamId = d.teamId;
+        applyAccent();
+        break;
+      case "radio_driver":
+        if (!d.driver || d.driver === lastDriverText) break;
+        if (awaitingReply) {
+          showDriver(d.driver);     // our own words, back from speech-to-text
+        } else {
+          lastDriverText = d.driver;
+          enqueue({ speaker: "driver", text: d.driver }, true);
+        }
+        break;
+      case "radio":
+        if (d.driver && d.driver !== lastDriverText) {
+          lastDriverText = d.driver;
+          enqueue({ speaker: "driver", text: d.driver });
+        }
+        enqueue({ speaker: "engineer", text: d.voice || d.advice, audio_url: d.audio_url });
+        break;
+      case "strategy":
+      case "coaching":
+      case "radio_test":
+        if (d.voice) enqueue({ speaker: "engineer", text: d.voice, audio_url: d.audio_url });
+        break;
+    }
+  };
+  ws.onclose = () => setTimeout(connect, 2000);
+  ws.onerror = () => ws.close();
+}
+
+// ---------------------------------------------------------------- demo
+function demo() {
+  player.name = player.name || "Driver";
+  player.number = player.number || "44";
+  const lines = [
+    { speaker: "engineer", text: "Box this lap, box this lap. Mediums are ready." },
+    { speaker: "driver", text: "Copy. How are the rears looking?" },
+    { speaker: "engineer", text: "Rears at sixty percent. Squeeze the throttle out of corner five, you're spinning them up." },
+    { speaker: "engineer", text: "Gap behind one point two. He has DRS, defend into turn one." },
+  ];
+  let i = 0;
+  (function loop() {
+    if (!busy && !queue.length && !txActive) enqueue({ ...lines[i++ % lines.length] });
+    setTimeout(loop, 1500);
+  })();
+}
+
+if (cfg.demo) demo(); else connect();
+</script>
+</body>
+</html>

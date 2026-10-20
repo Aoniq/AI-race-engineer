@@ -2,11 +2,18 @@
 Telemetry → Foundry strategy analysis → Foundry TTS → broadcast to frontend.
 Driver pit radio: browser mic → Foundry STT → Foundry chat → Foundry TTS.
 Supports: F1 25 UDP (PC/PS5/Xbox), GT7 JSON over UDP, WebSocket simulator fallback.
+
+Front-ends on /ws/pitradio:
+  dashboard  (/)        full telemetry + radio + coaching
+  overlay    (/overlay) team-radio overlay on top of the game or in OBS; no telemetry frames.
+             When an overlay plays the radio audio (?audio=1), dashboards stay silent.
 """
 import asyncio, json, time, os, webbrowser, threading, urllib.request
 from contextlib import asynccontextmanager
 from pathlib import Path
 from dotenv import load_dotenv
+from dataclasses import dataclass, field
+
 from fastapi import FastAPI, File, UploadFile, WebSocket
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, Response
@@ -26,6 +33,9 @@ UDP_TIMEOUT = 5.0
 UDP_DEBUG = os.getenv("UDP_DEBUG", "0") == "1"
 UDP_DUMP = os.getenv("UDP_DUMP", "0") == "1"
 ANALYSIS_INTERVAL = float(os.getenv("ANALYSIS_INTERVAL", "15"))
+# 127.0.0.1 = this PC only; 0.0.0.0 = also reachable from a phone/tablet/second PC on your network
+HTTP_HOST = os.getenv("HOST", "127.0.0.1").strip() or "127.0.0.1"
+HTTP_PORT = int(os.getenv("PORT", "8000"))
 MAX_RADIO_AUDIO_BYTES = 10 * 1024 * 1024
 # Spoken coaching after a lap: auto = driving tips in practice/qualifying/time trial,
 # only tyre-saving tips in races; always = every session; off = screen and radio only
@@ -33,7 +43,15 @@ COACH_VOICE = os.getenv("COACH_VOICE", "auto").strip().lower()
 COACH_RACE_EVERY_LAPS = max(1, int(os.getenv("COACH_RACE_EVERY_LAPS", "3")))
 COACH_MIN_LOSS_S = float(os.getenv("COACH_MIN_LOSS_S", "0.08"))
 
-pit_radios: dict = {}  # dashboard websocket -> asyncio.Lock (one send at a time per client)
+@dataclass
+class Frontend:
+  role: str = "dashboard"          # dashboard | overlay
+  plays_audio: bool = True
+  lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # one send at a time per client
+
+
+pit_radios: dict = {}  # websocket -> Frontend
+_player_info: dict = {}
 UI_MAX_FPS = float(os.getenv("UI_MAX_FPS", "15"))
 _last_ui_push = 0.0
 _last_analysis_time = 0.0
@@ -183,18 +201,48 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 app.mount("/audio", StaticFiles(directory=BASE_DIR / "static/audio"), name="audio")
 
 
+async def _send(ws, fe: "Frontend", payload: dict) -> bool:
+  try:
+    async with fe.lock:
+      await ws.send_json(payload)
+    return True
+  except Exception as e:
+    print(f"{fe.role.capitalize()} disconnected ({type(e).__name__})")
+    pit_radios.pop(ws, None)
+    return False
+
+
 async def _broadcast(payload: dict, droppable: bool = False):
-  """Send to every dashboard. Telemetry frames are `droppable`: skipped for a client that is
-  still busy receiving the previous message, so advice, coaching and radio always get through."""
-  for client, lock in list(pit_radios.items()):
-    if droppable and lock.locked():
+  """Send to every front-end. Telemetry frames are `droppable`: skipped for a client that is
+  still busy receiving the previous message (and never sent to overlays), so advice,
+  coaching and radio always get through."""
+  for ws, fe in list(pit_radios.items()):
+    if droppable and (fe.role == "overlay" or fe.lock.locked()):
       continue
-    try:
-      async with lock:
-        await client.send_json(payload)
-    except Exception as e:
-      print(f"Dashboard disconnected ({type(e).__name__})")
-      pit_radios.pop(client, None)
+    await _send(ws, fe, payload)
+
+
+def _overlay_has_audio() -> bool:
+  return any(fe.role == "overlay" and fe.plays_audio for fe in pit_radios.values())
+
+
+async def _announce_audio_route():
+  """Tell dashboards whether an overlay is playing the radio, so audio never doubles up."""
+  await _broadcast({"type": "audio_route", "overlay": _overlay_has_audio()})
+
+
+async def _update_player_info(cars: list, player_idx: int):
+  global _player_info
+  me = next((c for c in cars if c.get("idx") == player_idx), None)
+  if not me:
+    return
+  info = {"type": "player", "name": me.get("name") or "", "teamId": me.get("teamId"),
+          "raceNumber": me.get("raceNumber")}
+  if info != _player_info:
+    _player_info = info
+    for ws, fe in list(pit_radios.items()):
+      if fe.role == "overlay":
+        await _send(ws, fe, info)
 
 
 async def _run_analysis(cars: list, player_idx: int, lap: int, source: str, track: dict = None):
@@ -215,6 +263,7 @@ async def _run_analysis(cars: list, player_idx: int, lap: int, source: str, trac
     print(advice[:200])
 
   await _broadcast({
+    "type": "strategy",
     "advice": advice,
     "voice": voice,
     "audio_url": audio_url,
@@ -243,6 +292,7 @@ async def process_frame(data: dict, source: str):
   _last_player_idx = player_idx
   _last_lap = lap
   _last_track = track
+  await _update_player_info(cars, player_idx)
 
   now = time.time()
   if now - _last_ui_push >= 1.0 / UI_MAX_FPS:
@@ -281,6 +331,31 @@ async def get_index():
   return HTMLResponse((BASE_DIR / "static/index.html").read_text(encoding="utf-8"))
 
 
+@app.get("/overlay")
+async def get_overlay():
+  """Team-radio overlay: transparent page for the desktop overlay app or an OBS browser source."""
+  return HTMLResponse((BASE_DIR / "static/overlay.html").read_text(encoding="utf-8"))
+
+
+TEST_LINES = [
+  "Radio check. Loud and clear, good luck out there.",
+  "Box this lap, box this lap. Mediums ready.",
+  "Gap behind is one point two. He has DRS, defend into turn one.",
+]
+_test_idx = 0
+
+
+@app.post("/api/overlay/test")
+async def api_overlay_test():
+  """Send a test radio call (with voice, if Foundry is set up) to every overlay and dashboard."""
+  global _test_idx
+  text = TEST_LINES[_test_idx % len(TEST_LINES)]
+  _test_idx += 1
+  audio_url = await synthesize(text)
+  await _broadcast({"type": "radio_test", "voice": text, "audio_url": audio_url})
+  return {"ok": True, "voice": text, "audio_url": audio_url}
+
+
 class RadioRequest(BaseModel):
   text: str
 
@@ -308,6 +383,8 @@ async def api_radio_audio(audio: UploadFile = File(...)):
     return {"ok": False, "error": "transcription failed"}
   if not text:
     return {"ok": False, "error": "no speech heard"}
+  # Show the driver's words straight away (overlay), while the engineer thinks
+  await _broadcast({"type": "radio_driver", "driver": text})
   return await _answer_driver(text)
 
 
@@ -358,9 +435,18 @@ async def telemetry_ws(websocket: WebSocket):
 
 @app.websocket("/ws/pitradio")
 async def pitradio_ws(websocket: WebSocket):
+  role = "overlay" if websocket.query_params.get("role") == "overlay" else "dashboard"
+  plays_audio = websocket.query_params.get("audio", "1") != "0"
   await websocket.accept()
-  pit_radios[websocket] = asyncio.Lock()
-  print(f"Frontend connected ({len(pit_radios)} online)")
+  fe = Frontend(role=role, plays_audio=plays_audio)
+  pit_radios[websocket] = fe
+  print(f"{role.capitalize()} connected ({len(pit_radios)} online"
+        f"{', plays radio audio' if role == 'overlay' and plays_audio else ''})")
+  await _send(websocket, fe, {"type": "audio_route", "overlay": _overlay_has_audio()})
+  if role == "overlay":
+    if _player_info:
+      await _send(websocket, fe, _player_info)
+    await _announce_audio_route()
   try:
     while True:
       await websocket.receive_text()
@@ -368,17 +454,20 @@ async def pitradio_ws(websocket: WebSocket):
     pass
   finally:
     pit_radios.pop(websocket, None)
+    if role == "overlay":
+      await _announce_audio_route()
 
 
 def _open_browser():
   try:
-    urllib.request.urlopen("http://127.0.0.1:8000", timeout=1)
-    webbrowser.open("http://127.0.0.1:8000")
+    urllib.request.urlopen(f"http://127.0.0.1:{HTTP_PORT}", timeout=1)
+    webbrowser.open(f"http://127.0.0.1:{HTTP_PORT}")
   except Exception:
     threading.Timer(2, _open_browser).start()
 
 
 if __name__ == "__main__":
-  threading.Timer(1, _open_browser).start()
+  if os.getenv("OPEN_BROWSER", "1") != "0":
+    threading.Timer(1, _open_browser).start()
   import uvicorn
-  uvicorn.run("server:app", host="127.0.0.1", port=8000)
+  uvicorn.run("server:app", host=HTTP_HOST, port=HTTP_PORT)
