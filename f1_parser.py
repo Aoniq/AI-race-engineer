@@ -521,6 +521,7 @@ class F1Accumulator:
       all_cars.append({
         "idx": idx,
         "raceNumber": c.get("raceNumber", idx),
+        "teamId": c.get("teamId"),
         "name": c.get("name", f"#{idx}"),
         "x": c.get("x", 0), "z": c.get("z", 0), "heading": c.get("heading", 0),
         "speed": c.get("speed", 0), "rpm": c.get("rpm", 0), "gear": c.get("gear", 0),

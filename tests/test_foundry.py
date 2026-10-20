@@ -59,7 +59,7 @@ def test_reasoning_effort_dropped_for_models_without_it(foundry, monkeypatch):
 
 def test_tts(foundry):
   audio = foundry.speak("Box box", "onyx", "calm engineer", 1.1)
-  assert audio.startswith(b"ID3")
+  assert audio.startswith(b"RIFF")  # the fake endpoint returns a playable clip
   req = fake_foundry.REQUESTS[-1]
   assert req["path"] == "/openai/deployments/my-tts/audio/speech"
   assert req["body"]["voice"] == "onyx" and req["body"]["input"] == "Box box"

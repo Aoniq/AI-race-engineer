@@ -345,7 +345,14 @@ function renderEnginePanel(physics) {
 const player = document.getElementById("player");
 let audioQueue = [];
 let isPlaying = false;
-function enqueueAudio(url) { audioQueue.push(url); if (!isPlaying) playNext(); }
+let overlayPlaysAudio = false;   // the in-game overlay speaks the radio: stay quiet here
+const playedAudio = new Set();   // each clip once, even if it arrives by reply and broadcast
+function enqueueAudio(url) {
+  if (!url || overlayPlaysAudio || playedAudio.has(url)) return;
+  playedAudio.add(url);
+  audioQueue.push(url);
+  if (!isPlaying) playNext();
+}
 function playNext() {
   if (audioQueue.length === 0) { isPlaying = false; return; }
   isPlaying = true;
@@ -780,7 +787,7 @@ let ws;
 function connect() {
   statusLeft.textContent = `${gameLabel} · Connecting...`;
   statusLeft.style.color = "#555";
-  ws = new WebSocket("ws://127.0.0.1:8000/ws/pitradio");
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/pitradio`);
 
   ws.onopen = () => {
     statusLeft.innerHTML = `${gameLabel} · <span class='ok'>Connected</span>`;
@@ -789,6 +796,17 @@ function connect() {
   ws.onmessage = e => {
     const d = JSON.parse(e.data);
 
+    if (d.type === "audio_route") {
+      overlayPlaysAudio = !!d.overlay;
+      radioHint.textContent = overlayPlaysAudio ? "Audio: in-game overlay" : "Space = toggle mic";
+      return;
+    }
+    if (d.type === "player" || d.type === "radio_driver") return;
+    if (d.type === "radio_test") {
+      radioLog.innerHTML = `<span class="eng">TEST:</span> ${esc(d.voice)}`;
+      enqueueAudio(d.audio_url);
+      return;
+    }
     if (d.type === "coaching") {
       if (d.corners) coachCorners = d.corners;
       renderCoach(d.report);
